@@ -279,8 +279,6 @@ pnpm test:concurrency    # simultaneous booking race assertions
 - `GET /health` — Liveness
 - `GET /health/ready` — Readiness (checks PostgreSQL + Redis)
 
-### Grafana
-Access at `http://localhost:3002` (admin/admin — change in production)
 
 ## 🔑 Key Engineering Decisions
 
