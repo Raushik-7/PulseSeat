@@ -1,10 +1,10 @@
 import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { prisma } from '../../plugins/prisma.js';
-import { requireAuth } from '../../middleware/auth.js';
-import { createBooking, cancelBooking } from './booking.service.js';
-import { NotFoundError, ValidationError } from '../../utils/errors.js';
-import { logger } from '../../utils/logger.js';
+import { prisma } from '../../plugins/prisma';
+import { requireAuth } from '../../middleware/auth';
+import { createBooking, cancelBooking } from './booking.service';
+import { NotFoundError, ValidationError } from '../../utils/errors';
+import { logger } from '../../utils/logger';
 
 const createBookingSchema = z.object({
   eventId: z.string().min(1),

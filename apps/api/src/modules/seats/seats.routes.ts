@@ -1,7 +1,7 @@
 import { FastifyInstance } from 'fastify';
-import { prisma } from '../../plugins/prisma.js';
-import { getRedis } from '../../plugins/redis.js';
-import { NotFoundError } from '../../utils/errors.js';
+import { prisma } from '../../plugins/prisma';
+import { getRedis } from '../../plugins/redis';
+import { NotFoundError } from '../../utils/errors';
 
 export async function seatsRoutes(app: FastifyInstance) {
   // GET /api/v1/events/:eventId/seats — Get all seats for an event

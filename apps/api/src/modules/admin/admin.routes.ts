@@ -1,7 +1,7 @@
 import { FastifyInstance } from 'fastify';
-import { prisma } from '../../plugins/prisma.js';
-import { getRedis } from '../../plugins/redis.js';
-import { requireAdmin } from '../../middleware/auth.js';
+import { prisma } from '../../plugins/prisma';
+import { getRedis } from '../../plugins/redis';
+import { requireAdmin } from '../../middleware/auth';
 
 export async function adminRoutes(app: FastifyInstance) {
   // All admin routes require ADMIN role

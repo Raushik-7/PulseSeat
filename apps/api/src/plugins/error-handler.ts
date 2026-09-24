@@ -1,7 +1,7 @@
 import { FastifyError, FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { ZodError } from 'zod';
-import { AppError } from '../utils/errors.js';
-import { logger } from '../utils/logger.js';
+import { AppError } from '../utils/errors';
+import { logger } from '../utils/logger';
 
 export async function errorHandler(app: FastifyInstance) {
   app.setErrorHandler((error: FastifyError, request: FastifyRequest, reply: FastifyReply) => {

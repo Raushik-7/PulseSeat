@@ -1,8 +1,12 @@
 // Application configuration loaded from environment variables
 
 export const config = {
-  // Server
-  port: parseInt(process.env.API_PORT || '3001', 10),
+  // Server — PORT first so platform-assigned ports (Railway/Render/Fly) win.
+  // Empty or '0' PORT values are ignored (some hosts export PORT=0 by default).
+  port:
+    process.env.PORT && process.env.PORT !== '0'
+      ? parseInt(process.env.PORT, 10)
+      : parseInt(process.env.API_PORT || '3001', 10),
   host: process.env.API_HOST || '0.0.0.0',
   nodeEnv: process.env.NODE_ENV || 'development',
   isDev: (process.env.NODE_ENV || 'development') === 'development',
@@ -31,11 +35,24 @@ export const config = {
     idempotencyExpiryS: parseInt(process.env.BOOKING_IDEMPOTENCY_EXPIRY_S || '3600', 10),
   },
 
-  // Payment
+  // Payment — Stripe or Mock
   payment: {
     provider: (process.env.PAYMENT_PROVIDER || 'mock') as 'mock' | 'stripe' | 'razorpay',
-    secret: process.env.PAYMENT_SECRET || '',
+    secret: process.env.STRIPE_SECRET_KEY || process.env.PAYMENT_SECRET || '',
+    webhookSecret: process.env.STRIPE_WEBHOOK_SECRET || '',
   },
+
+  // Email — SMTP
+  email: {
+    host: process.env.SMTP_HOST || '',
+    port: parseInt(process.env.SMTP_PORT || '587', 10),
+    user: process.env.SMTP_USER || '',
+    pass: process.env.SMTP_PASS || '',
+    from: process.env.SMTP_FROM || 'PulseSeat <noreply@pulseseat.dev>',
+  },
+
+  // Frontend URL (for email links)
+  appUrl: process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000',
 
   // Queue
   queue: {

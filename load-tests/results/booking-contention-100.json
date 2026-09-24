@@ -1,0 +1,190 @@
+{
+    "metrics": {
+        "vus_max": {
+            "max": 100,
+            "value": 100,
+            "min": 100
+        },
+        "booking_conflict": {
+            "passes": 99,
+            "fails": 1,
+            "thresholds": {
+                "rate>0": false
+            },
+            "value": 0.99
+        },
+        "http_req_duration{expected_response:true}": {
+            "avg": 128.27936019417476,
+            "min": 12.7678,
+            "med": 111.762,
+            "max": 736.3703,
+            "p(90)": 211.74148,
+            "p(95)": 212.413
+        },
+        "booking_other_failure": {
+            "passes": 0,
+            "fails": 100,
+            "value": 0
+        },
+        "booking_latency": {
+            "avg": 580.5216430000002,
+            "min": 504.0939,
+            "med": 584.94475,
+            "max": 736.3703,
+            "p(90)": 618.3124,
+            "p(95)": 623.0864750000001
+        },
+        "http_req_sending": {
+            "avg": 0.7148985148514849,
+            "min": 0,
+            "med": 0,
+            "max": 5.9088,
+            "p(90)": 3.011160000000001,
+            "p(95)": 5.049959999999994
+        },
+        "iteration_duration": {
+            "avg": 705.932681,
+            "min": 615.5754,
+            "med": 684.9372,
+            "max": 839.0432,
+            "p(90)": 828.9848599999999,
+            "p(95)": 834.9587
+        },
+        "http_req_duration": {
+            "p(90)": 612.24531,
+            "p(95)": 618.22098,
+            "avg": 349.1513272277228,
+            "min": 12.7678,
+            "med": 213.79325,
+            "max": 736.3703
+        },
+        "http_req_blocked": {
+            "p(95)": 4.0451,
+            "avg": 0.8286128712871281,
+            "min": 0,
+            "med": 0,
+            "max": 8.7052,
+            "p(90)": 2.5309
+        },
+        "data_sent": {
+            "count": 72174,
+            "rate": 71531.6174625394
+        },
+        "http_req_receiving": {
+            "p(90)": 0.7318600000000001,
+            "p(95)": 0.84048,
+            "avg": 0.2039693069306931,
+            "min": 0,
+            "med": 0,
+            "max": 2.1875
+        },
+        "iterations": {
+            "count": 100,
+            "rate": 99.10995297827391
+        },
+        "data_received": {
+            "count": 276769,
+            "rate": 274305.6257584389
+        },
+        "http_req_connecting": {
+            "avg": 0.6310084158415838,
+            "min": 0,
+            "med": 0,
+            "max": 6.576,
+            "p(90)": 2.4624900000000025,
+            "p(95)": 3.03614
+        },
+        "vus": {
+            "value": 17,
+            "min": 17,
+            "max": 17
+        },
+        "http_reqs": {
+            "count": 202,
+            "rate": 200.2021050161133
+        },
+        "booking_success": {
+            "passes": 1,
+            "fails": 99,
+            "value": 0.01
+        },
+        "http_req_tls_handshaking": {
+            "p(90)": 0,
+            "p(95)": 0,
+            "avg": 0,
+            "min": 0,
+            "med": 0,
+            "max": 0
+        },
+        "http_req_failed": {
+            "passes": 99,
+            "fails": 103,
+            "value": 0.4900990099009901
+        },
+        "http_req_waiting": {
+            "min": 11.892,
+            "med": 213.15735,
+            "max": 736.3703,
+            "p(90)": 612.20127,
+            "p(95)": 617.409965,
+            "avg": 348.2324594059406
+        },
+        "seats_booked": {
+            "count": 1,
+            "rate": 0.9910995297827391
+        },
+        "checks": {
+            "passes": 100,
+            "fails": 0,
+            "value": 1
+        }
+    },
+    "setup_data": {
+        "eventId": "cmue2dm1y03b3vj5sjzi7els8",
+        "eventName": "IPL 2027 Grand Final",
+        "seatIds": [
+            "cmue2dm2003b4vj5sq4ulp3mx",
+            "cmue2dm2003b5vj5s4rrh3dpp",
+            "cmue2dm2003b6vj5skom5i48l",
+            "cmue2dm2003b7vj5siexf5zaa",
+            "cmue2dm2003b8vj5s5te2rt9l",
+            "cmue2dm2003b9vj5sb3gdugok",
+            "cmue2dm2003bavj5so0w1rp1w",
+            "cmue2dm2003bbvj5s8ew21yhw",
+            "cmue2dm2003bcvj5s277bzgct",
+            "cmue2dm2003bdvj5s4fe6hnj9",
+            "cmue2dm2003bevj5sfudb8tlb",
+            "cmue2dm2003bfvj5sfakav4uq",
+            "cmue2dm2003bgvj5sbj0sy9gw",
+            "cmue2dm2003bhvj5sg690a0ch",
+            "cmue2dm2003bivj5s4yxwdjdz",
+            "cmue2dm2003bjvj5se36e1u6i",
+            "cmue2dm2003bkvj5sd4c1sxvg",
+            "cmue2dm2003blvj5sooh8a5zu",
+            "cmue2dm2003bmvj5s39etuhij",
+            "cmue2dm2003bnvj5shyvkr06a"
+        ]
+    },
+    "root_group": {
+        "groups": {},
+        "checks": {
+                "conflict 409": {
+                    "name": "conflict 409",
+                    "path": "::conflict 409",
+                    "id": "93e51e18c5981bdce619bf51b9318415",
+                    "passes": 99,
+                    "fails": 0
+                },
+                "booking 201": {
+                    "passes": 1,
+                    "fails": 0,
+                    "name": "booking 201",
+                    "path": "::booking 201",
+                    "id": "b126aae2dc7662b9772e00d359182276"
+                }
+            },
+        "name": "",
+        "path": "",
+        "id": "d41d8cd98f00b204e9800998ecf8427e"
+    }
+}

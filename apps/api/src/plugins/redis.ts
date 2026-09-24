@@ -1,5 +1,5 @@
 import Redis from 'ioredis';
-import { config } from '../config/index.js';
+import { config } from '../config/index';
 
 let redis: Redis | null = null;
 
@@ -23,6 +23,16 @@ export function getRedis(): Redis {
     });
   }
   return redis;
+}
+
+/**
+ * Create a Redis connection suitable for BullMQ.
+ * BullMQ requires maxRetriesPerRequest: null.
+ */
+export function getBullMQConnection(): Redis {
+  return new Redis(config.redisUrl, {
+    maxRetriesPerRequest: null,
+  });
 }
 
 export async function closeRedis(): Promise<void> {

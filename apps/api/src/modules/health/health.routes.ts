@@ -1,7 +1,7 @@
 import { FastifyInstance } from 'fastify';
-import { prisma } from '../../plugins/prisma.js';
-import { getRedis } from '../../plugins/redis.js';
-import { logger } from '../../utils/logger.js';
+import { prisma } from '../../plugins/prisma';
+import { getRedis } from '../../plugins/redis';
+import { logger } from '../../utils/logger';
 
 export async function healthRoutes(app: FastifyInstance) {
   // GET /health — Basic health check

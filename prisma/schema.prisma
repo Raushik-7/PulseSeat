@@ -8,7 +8,6 @@ generator client {
 datasource db {
   provider  = "postgresql"
   url       = env("DATABASE_URL")
-  directUrl = env("DIRECT_URL")
 }
 
 // ─── Enums ──────────────────────────────────────────────────────────────────
@@ -61,6 +60,7 @@ model User {
   email        String   @unique
   name         String
   passwordHash String   @map("password_hash")
+  emailVerified Boolean @default(false) @map("email_verified")
   role         UserRole @default(USER)
   avatarUrl    String?  @map("avatar_url")
   createdAt    DateTime @default(now()) @map("created_at")
@@ -78,13 +78,17 @@ model Event {
   name        String
   slug        String      @unique
   description String?     @db.Text
+  shortDescription String? @map("short_description")
   category    String
   venue       String
+  address     String?
   city        String
   eventDate   DateTime    @map("event_date")
   startTime   String      @map("start_time")
   endTime     String      @map("end_time")
   bannerUrl   String?     @map("banner_url")
+  galleryUrls String[]    @map("gallery_urls")
+  highlights  String[]
   status      EventStatus @default(DRAFT)
   createdAt   DateTime    @default(now()) @map("created_at")
   updatedAt   DateTime    @updatedAt @map("updated_at")

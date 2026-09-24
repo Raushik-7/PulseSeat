@@ -5,7 +5,9 @@ services:
     image: postgres:16-alpine
     container_name: pulseseat-postgres
     ports:
-      - "5432:5432"
+      # Host port 5432 may be occupied by a native Windows PostgreSQL install;
+      # the container is exposed on 5433 to avoid port contention.
+      - "5433:5432"
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres

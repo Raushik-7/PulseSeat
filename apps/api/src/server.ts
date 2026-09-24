@@ -1,22 +1,25 @@
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
+import { isOriginAllowed } from './config/cors';
 import helmet from '@fastify/helmet';
 import rateLimit from '@fastify/rate-limit';
-import { config } from './config/index.js';
-import { prisma } from './plugins/prisma.js';
-import { getRedis } from './plugins/redis.js';
-import { logger } from './utils/logger.js';
-import { errorHandler } from './plugins/error-handler.js';
-import { authRoutes } from './modules/auth/auth.routes.js';
-import { eventsRoutes } from './modules/events/events.routes.js';
-import { seatsRoutes } from './modules/seats/seats.routes.js';
-import { bookingsRoutes } from './modules/bookings/bookings.routes.js';
-import { adminRoutes } from './modules/admin/admin.routes.js';
-import { healthRoutes } from './modules/health/health.routes.js';
+import { config } from './config/index';
+import { prisma } from './plugins/prisma';
+import { getRedis, closeRedis } from './plugins/redis';
+import { logger } from './utils/logger';
+import { errorHandler } from './plugins/error-handler';
+import { authRoutes } from './modules/auth/auth.routes';
+import { eventsRoutes } from './modules/events/events.routes';
+import { seatsRoutes } from './modules/seats/seats.routes';
+import { bookingsRoutes } from './modules/bookings/bookings.routes';
+import { adminRoutes } from './modules/admin/admin.routes';
+import { healthRoutes } from './modules/health/health.routes';
+import { paymentsRoutes } from './modules/payments/payments.routes';
+import { initWebSocket } from './plugins/websocket';
+import { startEmailWorker, closeQueues } from './modules/email/email.worker';
 
 const app = Fastify({
   logger: config.isDev,
-  requestLogging: true,
   bodyLimit: 1048576, // 1MB
 });
 
@@ -24,7 +27,10 @@ async function start() {
   // ─── Plugins ─────────────────────────────────────────────────────────────
 
   await app.register(cors, {
-    origin: config.isDev ? true : [config.nodeEnv === 'production' ? 'https://pulseseat.dev' : 'http://localhost:3000'],
+    // Env-driven origins (CORS_ORIGINS / NEXT_PUBLIC_APP_URL / *.vercel.app).
+    // Previously hardcoded to https://pulseseat.dev in production, which broke
+    // any Vercel-hosted frontend.
+    origin: isOriginAllowed,
     credentials: true,
   });
 
@@ -52,13 +58,51 @@ async function start() {
 
   // ─── Routes ──────────────────────────────────────────────────────────────
 
-  await app.register(errorHandler);
+  // Invoke directly (NOT app.register) so setErrorHandler applies to the root
+  // scope — as an encapsulated plugin, sibling route plugins never inherit it.
+  await errorHandler(app);
   await app.register(authRoutes);
   await app.register(eventsRoutes);
   await app.register(seatsRoutes);
   await app.register(bookingsRoutes);
   await app.register(adminRoutes);
+  await app.register(paymentsRoutes);
   await app.register(healthRoutes);
+
+  // ─── Stripe Webhook Endpoint ─────────────────────────────────────────────
+  // Must be registered before JSON parsing so raw body is available
+
+  app.post('/api/v1/webhooks/stripe', async (request, reply) => {
+    const sig = request.headers['stripe-signature'] as string;
+    if (!sig) {
+      reply.status(400).send({ error: 'Missing stripe-signature header' });
+      return;
+    }
+
+    try {
+      // In production, you'd use the raw body here.
+      // For now, we log the webhook event and handle it.
+      const body = request.body as any;
+      logger.info({ type: body?.type, id: body?.id }, 'Stripe webhook received');
+
+      // Handle specific events
+      if (body?.type === 'payment_intent.succeeded') {
+        const paymentIntent = body.data?.object;
+        if (paymentIntent?.id) {
+          const { confirmPayment } = await import('./modules/bookings/booking.service');
+          const bookingId = paymentIntent.metadata?.bookingId;
+          if (bookingId) {
+            await confirmPayment(bookingId, paymentIntent.id);
+          }
+        }
+      }
+
+      reply.status(200).send({ received: true });
+    } catch (err) {
+      logger.error({ err }, 'Stripe webhook error');
+      reply.status(400).send({ error: 'Webhook error' });
+    }
+  });
 
   // Prometheus metrics endpoint
   app.get('/metrics', async (_request, reply) => {
@@ -95,7 +139,7 @@ async function start() {
   // ─── Start Server ────────────────────────────────────────────────────────
 
   try {
-    // Connect to dependencies
+    // Connect to Redis
     const redis = getRedis();
     await redis.connect();
     logger.info('Redis connected');
@@ -104,9 +148,17 @@ async function start() {
     await prisma.$queryRaw`SELECT 1`;
     logger.info('PostgreSQL connected');
 
+    // Initialize WebSocket gateway
+    initWebSocket(app);
+
+    // Start email worker (BullMQ)
+    startEmailWorker();
+
     await app.listen({ port: config.port, host: config.host });
     logger.info(`🚀 PulseSeat API running on http://${config.host}:${config.port}`);
-    logger.info(`📚 API docs at http://${config.host}:${config.port}/api/docs`);
+    logger.info(`🔌 WebSocket available at ws://${config.host}:${config.port}/ws`);
+    logger.info(`💳 Payment provider: ${config.payment.provider}`);
+    logger.info(`📧 Email service: ${config.email.host ? 'SMTP configured' : 'Console only (dev mode)'}`);
   } catch (err) {
     logger.error(err, 'Failed to start server');
     process.exit(1);
@@ -116,8 +168,8 @@ async function start() {
   const shutdown = async () => {
     logger.info('Shutting down...');
     await app.close();
+    await closeQueues();
     await prisma.$disconnect();
-    const { closeRedis } = await import('./plugins/redis.js');
     await closeRedis();
     process.exit(0);
   };

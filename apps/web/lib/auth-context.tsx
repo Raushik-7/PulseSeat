@@ -15,7 +15,6 @@ interface AuthContextType {
   token: string | null;
   isLoading: boolean;
   login: (email: string, password: string) => Promise<void>;
-  signup: (name: string, email: string, password: string) => Promise<void>;
   logout: () => void;
   isAdmin: boolean;
 }
@@ -53,14 +52,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setUser(u);
   };
 
-  const signup = async (name: string, email: string, password: string) => {
-    const res: any = await apiClient.signup({ name, email, password });
-    const { user: u, token: t } = res.data;
-    localStorage.setItem('pulseseat_token', t);
-    setToken(t);
-    setUser(u);
-  };
-
   const logout = () => {
     localStorage.removeItem('pulseseat_token');
     setToken(null);
@@ -74,7 +65,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         token,
         isLoading,
         login,
-        signup,
         logout,
         isAdmin: user?.role === 'ADMIN',
       }}

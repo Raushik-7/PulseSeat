@@ -51,12 +51,24 @@ export async function api<T = any>(path: string, options: ApiOptions = {}): Prom
 
 // Specific API methods
 export const apiClient = {
-  // Auth
+  // Auth — password with email verification
   signup: (data: { name: string; email: string; password: string }) =>
     api('/api/v1/auth/signup', { method: 'POST', body: data }),
 
   login: (data: { email: string; password: string }) =>
     api('/api/v1/auth/login', { method: 'POST', body: data }),
+
+  verifyEmail: (data: { token: string; email: string }) =>
+    api('/api/v1/auth/verify-email', { method: 'POST', body: data }),
+
+  resendVerification: (data: { email: string }) =>
+    api('/api/v1/auth/resend-verification', { method: 'POST', body: data }),
+
+  forgotPassword: (data: { email: string }) =>
+    api('/api/v1/auth/forgot-password', { method: 'POST', body: data }),
+
+  resetPassword: (data: { token: string; email: string; password: string }) =>
+    api('/api/v1/auth/reset-password', { method: 'POST', body: data }),
 
   getMe: (token: string) => api('/api/v1/auth/me', { token }),
 
@@ -114,6 +126,13 @@ export const apiClient = {
 
   resetSeats: (eventId: string, token: string) =>
     api(`/api/v1/admin/events/${eventId}/reset-seats`, { method: 'POST', token }),
+
+  // Payments
+  createPaymentIntent: (bookingId: string, token: string) =>
+    api('/api/v1/payments/create-intent', { method: 'POST', body: { bookingId }, token }),
+
+  confirmPayment: (bookingId: string, paymentIntentId: string, token: string) =>
+    api('/api/v1/payments/confirm', { method: 'POST', body: { bookingId, paymentIntentId }, token }),
 
   // Health
   getHealth: () => api('/health'),

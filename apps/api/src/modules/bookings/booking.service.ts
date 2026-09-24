@@ -1,27 +1,13 @@
-import { PrismaClient, SeatStatus, BookingStatus, PaymentStatus } from '@prisma/client';
-import { createIdempotencyKey } from '../utils/booking-reference.js';
-import { SeatConflictError, ConflictError, ValidationError, NotFoundError } from '../utils/errors.js';
-import { logger } from '../utils/logger.js';
-import { getRedis } from '../plugins/redis.js';
-import { config } from '../config/index.js';
-
-const prisma = new PrismaClient();
-
-// ─── Types ──────────────────────────────────────────────────────────────────
-
-export interface BookSeatsInput {
-  userId: string;
-  eventId: string;
-  seatIds: string[];
-  idempotencyKey?: string;
-}
-
-export interface BookingResult {
-  bookingId: string;
-  bookingReference: string;
-  totalAmount: number;
-  seatCount: number;
-}
+import { PrismaClient, SeatStatus, BookingStatus, PaymentStatus, PaymentProviderType } from '@prisma/client';
+import { createBookingReference } from '../../utils/booking-reference';
+import { SeatConflictError, ConflictError, ValidationError, NotFoundError, PaymentError } from '../../utils/errors';
+import { logger } from '../../utils/logger';
+import { getRedis } from '../../plugins/redis';
+import { config } from '../../config/index';
+import { getPaymentProvider, PaymentIntent } from '../payments/payments.service';
+import { enqueueBookingConfirmationEmail, enqueueBookingCancellationEmail } from '../email/email.worker';
+import { broadcastBulkSeatUpdate, broadcastAvailabilityUpdate } from '../../plugins/websocket';
+import { prisma } from '../../plugins/prisma';
 
 // ─── Concurrency-Safe Booking Service ────────────────────────────────────────
 //
@@ -36,14 +22,40 @@ export interface BookingResult {
 //   3. BEGIN TRANSACTION
 //   4. Lock requested seats in deterministic order (ascending seat ID)
 //   5. Verify all seats are AVAILABLE
-//   6. Create booking record
-//   7. Update seat status to BOOKED
-//   8. COMMIT
-//   9. Queue background jobs
-//  10. Return success
+//   6. Create payment intent (Stripe)
+//   7. Create booking record
+//   8. Update seat status to BOOKED
+//   9. COMMIT
+//  10. Queue background jobs (email, analytics)
+//  11. Broadcast real-time seat updates via WebSocket
+//  12. Return success
 //
 // If any step fails, the transaction is rolled back completely.
 // No partial bookings are ever created.
+
+// ─── Types ──────────────────────────────────────────────────────────────────
+
+export interface BookSeatsInput {
+  userId: string;
+  eventId: string;
+  seatIds: string[];
+  idempotencyKey?: string;
+  paymentMethodId?: string; // Stripe PaymentMethod ID for real payments
+}
+
+export interface BookingResult {
+  bookingId: string;
+  bookingReference: string;
+  totalAmount: number;
+  seatCount: number;
+  payment: {
+    status: string;
+    clientSecret?: string; // Stripe client secret for frontend confirmation
+    provider: string;
+  };
+}
+
+// ─── Create Booking ─────────────────────────────────────────────────────────
 
 export async function createBooking(input: BookSeatsInput): Promise<BookingResult> {
   const { userId, eventId, seatIds, idempotencyKey } = input;
@@ -65,7 +77,7 @@ export async function createBooking(input: BookSeatsInput): Promise<BookingResul
     const existing = await redis.get(`idempotency:${idempotencyKey}`);
     if (existing) {
       const parsed = JSON.parse(existing);
-      logger.info({ idempotencyKey, bookingId: parsed.bookingId }, 'Idempotent request - returning cached result');
+      logger.info({ idempotencyKey, bookingId: parsed.bookingId }, 'Idempotent request — returning cached result');
       return parsed;
     }
   }
@@ -119,7 +131,7 @@ export async function createBooking(input: BookSeatsInput): Promise<BookingResul
         await redis.incr('metrics:booking:conflicts');
         logger.info(
           { userId, eventId, unavailableSeats: seatNumbers },
-          'Booking conflict - seats unavailable',
+          'Booking conflict — seats unavailable',
         );
         throw new SeatConflictError(seatNumbers);
       }
@@ -127,9 +139,25 @@ export async function createBooking(input: BookSeatsInput): Promise<BookingResul
       // Calculate total
       const totalAmount = seats.reduce((sum, s) => sum + parseFloat(s.price), 0);
 
+      // ─── Payment Processing ──────────────────────────────────────────
+      const paymentProvider = getPaymentProvider();
+      let paymentIntent: PaymentIntent;
+
+      try {
+        const bookingRef = createBookingReference();
+        paymentIntent = await paymentProvider.createPayment(bookingRef, totalAmount, 'INR');
+      } catch (err) {
+        logger.error({ err, userId, eventId }, 'Payment creation failed');
+        throw new PaymentError('Payment processing failed. Please try again.');
+      }
+
       // Generate booking reference
-      const { createBookingReference } = await import('../utils/booking-reference.js');
       const bookingReference = createBookingReference();
+
+      // Determine payment provider type for DB
+      const providerType = config.payment.provider === 'stripe'
+        ? PaymentProviderType.STRIPE
+        : PaymentProviderType.MOCK;
 
       // Create booking
       const booking = await tx.booking.create({
@@ -137,9 +165,25 @@ export async function createBooking(input: BookSeatsInput): Promise<BookingResul
           userId,
           eventId,
           bookingReference,
-          status: BookingStatus.CONFIRMED,
+          status: config.payment.provider === 'mock'
+            ? BookingStatus.CONFIRMED
+            : BookingStatus.PENDING,
           totalAmount,
-          paymentStatus: PaymentStatus.PAID, // Mock payment succeeds
+          paymentStatus: config.payment.provider === 'mock'
+            ? PaymentStatus.PAID
+            : PaymentStatus.PENDING,
+        },
+      });
+
+      // Create payment record
+      await tx.payment.create({
+        data: {
+          bookingId: booking.id,
+          provider: providerType,
+          providerPaymentId: paymentIntent.id,
+          amount: totalAmount,
+          currency: 'INR',
+          status: paymentIntent.status === 'succeeded' ? PaymentStatus.PAID : PaymentStatus.PENDING,
         },
       });
 
@@ -181,6 +225,7 @@ export async function createBooking(input: BookSeatsInput): Promise<BookingResul
             bookingReference,
             seatCount: seats.length,
             totalAmount,
+            paymentId: paymentIntent.id,
           },
         },
       });
@@ -190,6 +235,11 @@ export async function createBooking(input: BookSeatsInput): Promise<BookingResul
         bookingReference: booking.bookingReference,
         totalAmount,
         seatCount: seats.length,
+        payment: {
+          status: paymentIntent.status,
+          clientSecret: paymentIntent.clientSecret || undefined,
+          provider: config.payment.provider,
+        },
       };
     },
     {
@@ -214,16 +264,66 @@ export async function createBooking(input: BookSeatsInput): Promise<BookingResul
   await redis.del(`event:${eventId}`);
   await redis.del('events:list');
 
-  // 7. Queue background jobs (non-critical, fire-and-forget)
+  // 7. Queue background jobs (email + analytics)
   try {
-    // In a real system, these would be BullMQ jobs
-    logger.info(
-      { bookingId: result.bookingId, reference: result.bookingReference },
-      'Background jobs queued: confirmation email, invoice, analytics',
-    );
+    // Fetch user info for email
+    const user = await prisma.user.findUnique({ where: { id: userId } });
+    const event = await prisma.event.findUnique({ where: { id: eventId } });
+
+    if (user && event) {
+      const seatData = await prisma.seat.findMany({
+        where: { id: { in: uniqueSeatIds } },
+        select: { seatNumber: true, row: true, section: true },
+      });
+
+      // Queue confirmation email
+      await enqueueBookingConfirmationEmail({
+        userName: user.name,
+        userEmail: user.email,
+        bookingReference: result.bookingReference,
+        eventName: event.name,
+        eventDate: event.eventDate.toISOString().split('T')[0],
+        eventTime: `${event.startTime} — ${event.endTime}`,
+        venue: event.venue,
+        city: event.city,
+        seats: seatData,
+        totalAmount: result.totalAmount,
+      });
+    }
   } catch (err) {
     // Background job failure should not affect the booking response
     logger.error({ err }, 'Failed to queue background jobs');
+  }
+
+  // 8. Broadcast real-time seat updates via WebSocket
+  try {
+    broadcastBulkSeatUpdate(
+      eventId,
+      uniqueSeatIds.map((seatId) => ({
+        seatId,
+        seatNumber: '', // Frontend will use seatId to update
+        status: 'BOOKED',
+        eventId,
+        bookedBy: userId,
+      })),
+    );
+
+    // Broadcast updated availability
+    const availableNow = await prisma.seat.count({
+      where: { eventId, status: SeatStatus.AVAILABLE },
+    });
+    const totalNow = await prisma.seat.count({ where: { eventId } });
+    const bookedNow = await prisma.seat.count({
+      where: { eventId, status: SeatStatus.BOOKED },
+    });
+
+    broadcastAvailabilityUpdate(eventId, {
+      available: availableNow,
+      booked: bookedNow,
+      total: totalNow,
+    });
+  } catch (err) {
+    logger.error({ err }, 'Failed to broadcast seat updates');
   }
 
   logger.info(
@@ -234,12 +334,42 @@ export async function createBooking(input: BookSeatsInput): Promise<BookingResul
   return result;
 }
 
+// ─── Confirm Payment (for Stripe async flow) ────────────────────────────────
+
+export async function confirmPayment(bookingId: string, paymentIntentId: string): Promise<void> {
+  const booking = await prisma.booking.findUnique({ where: { id: bookingId } });
+  if (!booking) throw new NotFoundError('Booking', bookingId);
+
+  const paymentProvider = getPaymentProvider();
+  const intent = await paymentProvider.verifyPayment(paymentIntentId);
+
+  if (intent.status === 'succeeded') {
+    await prisma.$transaction(async (tx) => {
+      await tx.booking.update({
+        where: { id: bookingId },
+        data: { status: BookingStatus.CONFIRMED, paymentStatus: PaymentStatus.PAID },
+      });
+      await tx.payment.update({
+        where: { providerPaymentId: paymentIntentId },
+        data: { status: PaymentStatus.PAID },
+      });
+    });
+
+    logger.info({ bookingId, paymentIntentId }, 'Payment confirmed and booking activated');
+  }
+}
+
 // ─── Cancel Booking ──────────────────────────────────────────────────────────
 
 export async function cancelBooking(bookingId: string, userId: string): Promise<void> {
   const booking = await prisma.booking.findUnique({
     where: { id: bookingId },
-    include: { bookingItems: true },
+    include: {
+      bookingItems: true,
+      event: { select: { id: true, name: true } },
+      user: { select: { name: true, email: true } },
+      payments: { select: { providerPaymentId: true, provider: true } },
+    },
   });
 
   if (!booking) {
@@ -254,9 +384,10 @@ export async function cancelBooking(bookingId: string, userId: string): Promise<
     throw new ConflictError(`Cannot cancel booking in ${booking.status} status`);
   }
 
+  const seatIds = booking.bookingItems.map((item) => item.seatId);
+
   await prisma.$transaction(async (tx) => {
     // Release seats
-    const seatIds = booking.bookingItems.map((item) => item.seatId);
     await tx.seat.updateMany({
       where: { id: { in: seatIds } },
       data: { status: SeatStatus.AVAILABLE, bookedBy: null },
@@ -282,9 +413,69 @@ export async function cancelBooking(bookingId: string, userId: string): Promise<
     });
   });
 
+  // ─── Process Refund (Stripe) ──────────────────────────────────────────
+  try {
+    const paymentRecord = booking.payments[0];
+    if (paymentRecord?.providerPaymentId && booking.paymentStatus === PaymentStatus.PAID) {
+      const paymentProvider = getPaymentProvider();
+      await paymentProvider.refundPayment(paymentRecord.providerPaymentId);
+      logger.info({ bookingId, paymentIntentId: paymentRecord.providerPaymentId }, 'Refund processed');
+    }
+  } catch (err) {
+    logger.error({ err, bookingId }, 'Refund failed — manual review required');
+    // Don't throw — booking is cancelled, refund is a separate concern
+  }
+
+  // ─── Send Cancellation Email ──────────────────────────────────────────
+  try {
+    if (booking.user) {
+      await enqueueBookingCancellationEmail({
+        userName: booking.user.name,
+        userEmail: booking.user.email,
+        bookingReference: booking.bookingReference,
+        eventName: booking.event?.name || 'Unknown Event',
+        refundAmount: Number(booking.totalAmount),
+      });
+    }
+  } catch (err) {
+    logger.error({ err }, 'Failed to queue cancellation email');
+  }
+
+  // ─── Broadcast Seat Release ───────────────────────────────────────────
+  try {
+    broadcastBulkSeatUpdate(
+      booking.eventId,
+      seatIds.map((seatId) => ({
+        seatId,
+        seatNumber: '',
+        status: 'AVAILABLE',
+        eventId: booking.eventId,
+        bookedBy: null,
+      })),
+    );
+
+    const availableNow = await prisma.seat.count({
+      where: { eventId: booking.eventId, status: SeatStatus.AVAILABLE },
+    });
+    const totalNow = await prisma.seat.count({ where: { eventId: booking.eventId } });
+    const bookedNow = await prisma.seat.count({
+      where: { eventId: booking.eventId, status: SeatStatus.BOOKED },
+    });
+
+    broadcastAvailabilityUpdate(booking.eventId, {
+      available: availableNow,
+      booked: bookedNow,
+      total: totalNow,
+    });
+  } catch (err) {
+    logger.error({ err }, 'Failed to broadcast seat release');
+  }
+
   // Invalidate cache
   const redis = getRedis();
   await redis.del(`event:${booking.eventId}:availability`);
   await redis.del(`event:${booking.eventId}`);
   await redis.incr('metrics:booking:cancellations');
+
+  logger.info({ bookingId, userId }, 'Booking cancelled');
 }

@@ -1,18 +1,20 @@
 import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { prisma } from '../../plugins/prisma.js';
-import { getRedis } from '../../plugins/redis.js';
-import { requireAuth, requireAdmin } from '../../middleware/auth.js';
-import { NotFoundError, ValidationError } from '../../utils/errors.js';
-import { logger } from '../../utils/logger.js';
+import { prisma } from '../../plugins/prisma';
+import { getRedis } from '../../plugins/redis';
+import { requireAuth, requireAdmin } from '../../middleware/auth';
+import { NotFoundError, ValidationError } from '../../utils/errors';
+import { logger } from '../../utils/logger';
 
 const createEventSchema = z.object({
   name: z.string().min(1).max(200),
   slug: z.string().min(1).max(200).optional(),
   description: z.string().optional(),
+  shortDescription: z.string().max(300).optional(),
   category: z.string().min(1).max(50),
   venue: z.string().min(1).max(200),
   city: z.string().min(1).max(100),
+  address: z.string().max(300).optional(),
   eventDate: z.string().datetime(),
   startTime: z.string(),
   endTime: z.string(),
@@ -63,7 +65,7 @@ export async function eventsRoutes(app: FastifyInstance) {
         where,
         include: {
           seats: {
-            select: { status: true },
+            select: { status: true, price: true },
           },
         },
         orderBy: { eventDate: 'asc' },
@@ -73,13 +75,17 @@ export async function eventsRoutes(app: FastifyInstance) {
       prisma.event.count({ where }),
     ]);
 
-    // Enrich with availability counts
+    // Enrich with availability counts and min price
     const enrichedEvents = events.map((event) => {
       const totalSeats = event.seats.length;
       const bookedSeats = event.seats.filter((s) => s.status === 'BOOKED' || s.status === 'HELD').length;
       const availableSeats = totalSeats - bookedSeats;
+      const availableSeatPrices = event.seats
+        .filter((s) => s.status === 'AVAILABLE')
+        .map((s) => Number(s.price));
+      const minPrice = availableSeatPrices.length > 0 ? Math.min(...availableSeatPrices) : 0;
       const { seats, ...eventData } = event;
-      return { ...eventData, totalSeats, availableSeats };
+      return { ...eventData, totalSeats, availableSeats, minPrice };
     });
 
     const result = {
@@ -160,9 +166,11 @@ export async function eventsRoutes(app: FastifyInstance) {
         name: body.name,
         slug,
         description: body.description,
+        shortDescription: body.shortDescription,
         category: body.category,
         venue: body.venue,
         city: body.city,
+        address: body.address,
         eventDate: new Date(body.eventDate),
         startTime: body.startTime,
         endTime: body.endTime,

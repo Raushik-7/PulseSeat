@@ -1,7 +1,7 @@
 import { FastifyRequest, FastifyReply } from 'fastify';
 import { createHmac } from 'crypto';
-import { prisma } from '../plugins/prisma.js';
-import { config } from '../config/index.js';
+import { prisma } from '../plugins/prisma';
+import { config } from '../config/index';
 
 export interface AuthUser {
   id: string;
@@ -31,8 +31,9 @@ export function signToken(user: AuthUser): string {
     }),
   );
 
+  const data = `${header}.${payload}`;
   const signature = base64UrlEncode(
-    createHmac('sha256', config.jwtSecret).update(`${header}.${payload}`).digest(),
+    createHmac('sha256', config.jwtSecret).update(data).digest('base64'),
   );
 
   return `${header}.${payload}.${signature}`;
@@ -43,8 +44,9 @@ export function verifyToken(token: string): AuthUser | null {
     const [header, payload, signature] = token.split('.');
     if (!header || !payload || !signature) return null;
 
+    const data = `${header}.${payload}`;
     const expectedSignature = base64UrlEncode(
-      createHmac('sha256', config.jwtSecret).update(`${header}.${payload}`).digest(),
+      createHmac('sha256', config.jwtSecret).update(data).digest('base64'),
     );
 
     if (signature !== expectedSignature) return null;
