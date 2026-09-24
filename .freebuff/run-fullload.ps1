@@ -1,2 +1,0 @@
-$p = Start-Process -FilePath 'D:\PulseSeat\tools\k6-v2.3.0-windows-amd64\k6.exe' -ArgumentList 'run','D:\PulseSeat\load-tests\full-load.js','--summary-export=D:\PulseSeat\load-tests\results\full-load.json' -WorkingDirectory 'D:\PulseSeat' -RedirectStandardOutput 'D:\PulseSeat\load-tests\results\full-load-console.log' -RedirectStandardError 'D:\PulseSeat\load-tests\results\full-load-console.err' -WindowStyle Hidden -PassThru
-Write-Host "K6_PID:$($p.Id)"
