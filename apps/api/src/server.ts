@@ -6,6 +6,7 @@ import rateLimit from '@fastify/rate-limit';
 import { config } from './config/index';
 import { prisma } from './plugins/prisma';
 import { getRedis, closeRedis } from './plugins/redis';
+import { getBookingMetrics } from './plugins/booking-metrics';
 import { logger } from './utils/logger';
 import { errorHandler } from './plugins/error-handler';
 import { authRoutes } from './modules/auth/auth.routes';
@@ -17,6 +18,7 @@ import { healthRoutes } from './modules/health/health.routes';
 import { paymentsRoutes } from './modules/payments/payments.routes';
 import { initWebSocket } from './plugins/websocket';
 import { startEmailWorker, closeQueues } from './modules/email/email.worker';
+import { startMaintenanceLoop, stopMaintenanceLoop } from './maintenance';
 
 const app = Fastify({
   logger: config.isDev,
@@ -54,6 +56,23 @@ async function start() {
 
   app.addHook('onRequest', async (request) => {
     request.id = request.headers['x-request-id'] as string || `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  });
+
+  // F.6-8 — Structured request logs: method, route template, status, duration.
+  // Health endpoints are skipped (probe noise); nothing sensitive is logged.
+  app.addHook('onResponse', async (request, reply) => {
+    const url = request.raw.url || '';
+    if (url.startsWith('/health')) return;
+    logger.info(
+      {
+        requestId: request.id,
+        method: request.method,
+        route: request.routeOptions?.url || url.split('?')[0],
+        status: reply.statusCode,
+        durationMs: Math.round(reply.elapsedTime),
+      },
+      'request',
+    );
   });
 
   // ─── Routes ──────────────────────────────────────────────────────────────
@@ -104,32 +123,27 @@ async function start() {
     }
   });
 
-  // Prometheus metrics endpoint
+  // Prometheus metrics endpoint — booking counters now live in Postgres,
+  // so a metrics scrape costs ZERO Redis commands (previously 4 GETs).
   app.get('/metrics', async (_request, reply) => {
-    const redis = getRedis();
-    const [attempts, success, conflicts, cancellations] = await Promise.all([
-      redis.get('metrics:booking:attempts'),
-      redis.get('metrics:booking:success'),
-      redis.get('metrics:booking:conflicts'),
-      redis.get('metrics:booking:cancellations'),
-    ]);
+    const m = await getBookingMetrics();
 
     const metrics = [
       '# HELP booking_attempts_total Total booking attempts',
       '# TYPE booking_attempts_total counter',
-      `booking_attempts_total ${attempts || 0}`,
+      `booking_attempts_total ${m.attempts}`,
       '',
       '# HELP booking_success_total Successful bookings',
       '# TYPE booking_success_total counter',
-      `booking_success_total ${success || 0}`,
+      `booking_success_total ${m.success}`,
       '',
       '# HELP booking_conflicts_total Booking conflicts (double-booking attempts)',
       '# TYPE booking_conflicts_total counter',
-      `booking_conflicts_total ${conflicts || 0}`,
+      `booking_conflicts_total ${m.conflicts}`,
       '',
       '# HELP booking_cancellations_total Booking cancellations',
       '# TYPE booking_cancellations_total counter',
-      `booking_cancellations_total ${cancellations || 0}`,
+      `booking_cancellations_total ${m.cancellations}`,
     ].join('\n');
 
     reply.header('Content-Type', 'text/plain');
@@ -139,20 +153,36 @@ async function start() {
   // ─── Start Server ────────────────────────────────────────────────────────
 
   try {
-    // Connect to Redis
-    const redis = getRedis();
-    await redis.connect();
-    logger.info('Redis connected');
+    // Connect to Redis — non-fatal. The API serves all public reads straight
+    // from Postgres when the cache is unreachable (see plugins/redis-safe.ts);
+    // failing startup over an optional cache turns a Redis outage into a full
+    // API outage (that combination is what knocked the live site dark).
+    try {
+      const redis = getRedis();
+      // Kick off connect() but do NOT await it indefinitely — a black-holed
+      // Redis (quota, network) must never block server boot. lazyConnect+
+      // retryStrategy keeps it reconnecting in the background; the first few
+      // cache calls may miss, which is harmless (Postgres serves reads).
+      const connectReady = redis.connect();
+      connectReady
+        .then(() => logger.info('Redis connected'))
+        .catch((err: unknown) =>
+          logger.error({ errMessage: err instanceof Error ? err.message : String(err) }, 'Redis unavailable at startup — continuing in degraded-cache mode (reads fall back to Postgres)'),
+        );
+    } catch (err) {
+      logger.error({ err }, 'Redis client init failed — continuing in degraded-cache mode');
+    }
 
-    // Verify database connection
+    // Verify database connection — Postgres IS fatal. No DB = no service.
     await prisma.$queryRaw`SELECT 1`;
     logger.info('PostgreSQL connected');
 
     // Initialize WebSocket gateway
     initWebSocket(app);
 
-    // Start email worker (BullMQ)
+    // Start email worker (BullMQ) and the low-frequency maintenance loop
     startEmailWorker();
+    startMaintenanceLoop();
 
     await app.listen({ port: config.port, host: config.host });
     logger.info(`🚀 PulseSeat API running on http://${config.host}:${config.port}`);
@@ -169,6 +199,7 @@ async function start() {
     logger.info('Shutting down...');
     await app.close();
     await closeQueues();
+    stopMaintenanceLoop();
     await prisma.$disconnect();
     await closeRedis();
     process.exit(0);

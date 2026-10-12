@@ -1,7 +1,8 @@
 import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { prisma } from '../../plugins/prisma';
-import { getRedis } from '../../plugins/redis';
+import { cacheGet, cacheSet, cacheDel } from '../../plugins/redis-safe';
+import { eventsListVersion, bumpEventsListVersion } from './events.cache';
 import { requireAuth, requireAdmin } from '../../middleware/auth';
 import { NotFoundError, ValidationError } from '../../utils/errors';
 import { logger } from '../../utils/logger';
@@ -24,6 +25,14 @@ const createEventSchema = z.object({
 
 const updateEventSchema = createEventSchema.partial();
 
+// ─── List-cache versioning ─────────────────────────────────────────────────
+// The list cache key embeds the raw query string, so mutations can't know
+// every key to delete. Mutations instead bump a version counter that every
+// list read folds into its cache key — instantly invalidating all variants.
+// Falls back to version 0 (short 60s TTL bounds staleness) if Redis is down.
+// List cache version helpers live in ./events.cache (shared with the booking
+// service). Local duplicates removed.
+
 export async function eventsRoutes(app: FastifyInstance) {
   // GET /api/v1/events — List events with filtering, pagination, search
   app.get('/api/v1/events', async (request, reply) => {
@@ -32,14 +41,16 @@ export async function eventsRoutes(app: FastifyInstance) {
     const limit = Math.min(50, Math.max(1, parseInt(query.limit || '12', 10)));
     const skip = (page - 1) * limit;
 
-    // Build cache key
-    const cacheKey = `events:list:${JSON.stringify({ page, limit, ...query })}`;
-    const redis = getRedis();
+    // Build cache key. NOTE: the cache is an optimization only — if Redis is
+    // unavailable (free-tier quota, network blip) we still serve the list
+    // straight from Postgres. Cache failures used to 500 this endpoint, which
+    // is how event cards vanished from the live site while the DB was fine.
+    const listVersion = await eventsListVersion();
+    const cacheKey = `events:list:v${listVersion}:${JSON.stringify({ page, limit, ...query })}`;
 
-    // Try cache first
-    const cached = await redis.get(cacheKey);
+    const cached = await cacheGet<unknown>(cacheKey);
     if (cached) {
-      reply.send(JSON.parse(cached));
+      reply.send(cached);
       return;
     }
 
@@ -60,14 +71,12 @@ export async function eventsRoutes(app: FastifyInstance) {
       if (query.dateTo) where.eventDate.lte = new Date(query.dateTo);
     }
 
+    // Perf: instead of pulling every seat row per event (6,130 rows for a
+    // 12-event page), one GROUP BY query computes the aggregate per event.
+    // This was the heaviest query on the whole site.
     const [events, total] = await Promise.all([
       prisma.event.findMany({
         where,
-        include: {
-          seats: {
-            select: { status: true, price: true },
-          },
-        },
         orderBy: { eventDate: 'asc' },
         skip,
         take: limit,
@@ -75,17 +84,39 @@ export async function eventsRoutes(app: FastifyInstance) {
       prisma.event.count({ where }),
     ]);
 
-    // Enrich with availability counts and min price
+    // One GROUP BY for exactly the events on this page (instead of shipping
+    // every seat row across the wire — 6,130 rows for a 12-event page).
+    const pageEventIds = events.map((e) => e.id);
+    const agg = pageEventIds.length
+      ? await prisma.seat.groupBy({
+          by: ['eventId', 'status'],
+          where: { eventId: { in: pageEventIds } },
+          _count: true,
+          _min: { price: true },
+        })
+      : [];
+
+    // Build per-event aggregates: { eventId: { total, booked, minAvailablePrice } }
+    const stats: Record<string, { total: number; unavailable: number; minAvailable: number | null }> = {};
+    for (const g of agg) {
+      const s = (stats[g.eventId] ||= { total: 0, unavailable: 0, minAvailable: null });
+      s.total += g._count;
+      if (g.status === 'BOOKED' || g.status === 'HELD' || g.status === 'DISABLED') s.unavailable += g._count;
+      if (g.status === 'AVAILABLE' && g._min.price != null) {
+        const p = Number(g._min.price);
+        s.minAvailable = s.minAvailable == null ? p : Math.min(s.minAvailable, p);
+      }
+    }
+
+    // Enrich with availability counts and min price from the aggregate
     const enrichedEvents = events.map((event) => {
-      const totalSeats = event.seats.length;
-      const bookedSeats = event.seats.filter((s) => s.status === 'BOOKED' || s.status === 'HELD').length;
-      const availableSeats = totalSeats - bookedSeats;
-      const availableSeatPrices = event.seats
-        .filter((s) => s.status === 'AVAILABLE')
-        .map((s) => Number(s.price));
-      const minPrice = availableSeatPrices.length > 0 ? Math.min(...availableSeatPrices) : 0;
-      const { seats, ...eventData } = event;
-      return { ...eventData, totalSeats, availableSeats, minPrice };
+      const s = stats[event.id] || { total: 0, unavailable: 0, minAvailable: null };
+      return {
+        ...event,
+        totalSeats: s.total,
+        availableSeats: s.total - s.unavailable,
+        minPrice: s.minAvailable ?? 0,
+      };
     });
 
     const result = {
@@ -99,8 +130,9 @@ export async function eventsRoutes(app: FastifyInstance) {
       },
     };
 
-    // Cache for 30 seconds
-    await redis.setex(cacheKey, 30, JSON.stringify(result));
+    // Cache for 60 seconds (public listing tolerates brief staleness);
+    // failure to cache is harmless and logged by the cache layer.
+    await cacheSet(cacheKey, result, 60);
 
     reply.send(result);
   });
@@ -108,12 +140,11 @@ export async function eventsRoutes(app: FastifyInstance) {
   // GET /api/v1/events/:id — Event detail
   app.get('/api/v1/events/:id', async (request, reply) => {
     const { id } = request.params as { id: string };
-    const redis = getRedis();
 
     const cacheKey = `event:${id}`;
-    const cached = await redis.get(cacheKey);
+    const cached = await cacheGet<unknown>(cacheKey);
     if (cached) {
-      reply.send(JSON.parse(cached));
+      reply.send(cached);
       return;
     }
 
@@ -147,7 +178,7 @@ export async function eventsRoutes(app: FastifyInstance) {
       },
     };
 
-    await redis.setex(cacheKey, 30, JSON.stringify(result));
+    await cacheSet(cacheKey, result, 60);
     reply.send(result);
   });
 
@@ -216,9 +247,10 @@ export async function eventsRoutes(app: FastifyInstance) {
       logger.info({ eventId: event.id, seatCount: seats.length }, 'Seats generated for event');
     }
 
-    // Invalidate cache
-    const redis = getRedis();
-    await redis.del('events:list:*' as any);
+    // Invalidate list cache. The list key embeds the full query object, so a
+    // single known key is not discoverable here — instead we bump an epoch
+    // that list requests fold into their cache key (see list route).
+    await bumpEventsListVersion();
 
     reply.status(201).send({ success: true, data: event });
   });
@@ -246,9 +278,8 @@ export async function eventsRoutes(app: FastifyInstance) {
       },
     });
 
-    const redis = getRedis();
-    await redis.del(`event:${id}`);
-    await redis.del(`event:${event.slug}`);
+    await cacheDel(`event:${id}`, `event:${event.slug}`);
+    await bumpEventsListVersion();
 
     reply.send({ success: true, data: updated });
   });
@@ -265,8 +296,8 @@ export async function eventsRoutes(app: FastifyInstance) {
       data: { status: 'CANCELLED' },
     });
 
-    const redis = getRedis();
-    await redis.del(`event:${id}`);
+    await cacheDel(`event:${id}`);
+    await bumpEventsListVersion();
 
     reply.send({ success: true, message: 'Event cancelled' });
   });

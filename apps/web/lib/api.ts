@@ -18,6 +18,20 @@ export class ApiError extends Error {
   }
 }
 
+export class ApiTimeoutError extends Error {
+  constructor(message = 'Request timed out') {
+    super(message);
+    this.name = 'ApiTimeoutError';
+  }
+}
+
+/**
+ * GET requests are wrapped so a slow/unreachable backend fails fast with a
+ * typed error instead of hanging until the browser gives up. Mutating requests
+ * (POST/DELETE) keep no client timeout — they may legitimately be slow.
+ */
+const GET_TIMEOUT_MS = 20_000;
+
 export async function api<T = any>(path: string, options: ApiOptions = {}): Promise<T> {
   const { method = 'GET', body, headers = {}, token } = options;
 
@@ -26,7 +40,7 @@ export async function api<T = any>(path: string, options: ApiOptions = {}): Prom
     authHeaders['Authorization'] = `Bearer ${token}`;
   }
 
-  const res = await fetch(`${API_URL}${path}`, {
+  const fetchInit: RequestInit = {
     method,
     headers: {
       'Content-Type': 'application/json',
@@ -34,19 +48,51 @@ export async function api<T = any>(path: string, options: ApiOptions = {}): Prom
       ...headers,
     },
     body: body ? JSON.stringify(body) : undefined,
-  });
+  };
 
-  const data = await res.json();
+  let res: Response;
+  try {
+    res = method === 'GET'
+      ? await withTimeout(fetch(`${API_URL}${path}`, fetchInit), GET_TIMEOUT_MS)
+      : await fetch(`${API_URL}${path}`, fetchInit);
+  } catch (err) {
+    if ((err as Error).name === 'AbortError') throw new ApiTimeoutError();
+    throw err; // network error / CORS / DNS — surfaces to callers as-is
+  }
+
+  let data: any;
+  try {
+    data = await res.json();
+  } catch {
+    // Empty or non-JSON body (e.g. 502 from a proxy) — don't crash parsing
+    data = {};
+  }
 
   if (!res.ok) {
     throw new ApiError(
       res.status,
-      data.error?.code || 'API_ERROR',
-      data.error?.message || 'An error occurred',
+      data?.error?.code || 'API_ERROR',
+      data?.error?.message || `Request failed (${res.status})`,
     );
   }
 
+  // Validate the standard success envelope; malformed shapes are logged and
+  // surfaced as errors instead of silently rendering as "empty data".
+  if (data && typeof data === 'object' && 'success' in data && data.success === false) {
+    throw new ApiError(res.status, data?.error?.code || 'API_ERROR', data?.error?.message || 'Request failed');
+  }
+
   return data;
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('AbortError')), ms);
+    promise.then(
+      (val) => { clearTimeout(timer); resolve(val); },
+      (err) => { clearTimeout(timer); reject(err); },
+    );
+  });
 }
 
 // Specific API methods

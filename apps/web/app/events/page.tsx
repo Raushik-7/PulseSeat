@@ -49,14 +49,22 @@ function EventsContent() {
   if (category) params.category = category;
   if (city) params.city = city;
 
-  const { data, isLoading } = useQuery({
+  // F.4/F.7/D.6 — A failed fetch must NOT look like "no events": we keep the
+  // last good page rendered and show an explicit stale/error banner instead.
+  // (Previously any network blip rendered `events = []`, which users saw as
+  // "event cards disappeared then came back" — the #1 production complaint.)
+  const { data, isLoading, isError, error, isFetching, dataUpdatedAt } = useQuery({
     queryKey: ['events', params],
     queryFn: () => apiClient.getEvents(params),
+    placeholderData: (prev) => prev, // keep previous page's cards while loading
   });
 
   const events = (data as any)?.data || [];
   const pagination = (data as any)?.pagination;
   const hasFilters = !!(search || category || city);
+  const isStale = isFetching || (isError && events.length > 0);
+
+  const lastRefreshed = dataUpdatedAt ? new Date(dataUpdatedAt).toLocaleTimeString() : null;
 
   return (
     <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 py-8">
@@ -154,6 +162,33 @@ function EventsContent() {
         </div>
       )}
 
+      {/* Stale / error banner (Phase A) — never silently swallow failures */}
+      {isError && events.length > 0 && (
+        <div className="mb-6 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-yellow-500/30 bg-yellow-500/10 px-4 py-3 text-sm text-yellow-200">
+          <span>
+            Couldn&apos;t reach the ticketing service just now — showing the last loaded events
+            {lastRefreshed ? ` (retrieved ${lastRefreshed})` : ''}.
+          </span>
+        </div>
+      )}
+      {isError && events.length === 0 && !isLoading && (
+        <div className="mb-6 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-200">
+          <span>
+            We couldn&apos;t load events{(error as any)?.statusCode ? ` (error ${(error as any).statusCode})` : ''}. This is usually temporary —
+            the service may be waking up from a cold start.
+          </span>
+          <button
+            onClick={() => window.location.reload()}
+            className="px-4 py-1.5 rounded-lg bg-red-500/20 border border-red-500/40 text-red-100 hover:bg-red-500/30 transition-colors text-xs font-medium"
+          >
+            Retry now
+          </button>
+        </div>
+      )}
+      {isFetching && !isLoading && !isError && (
+        <div className="mb-4 text-xs text-dark-500">Refreshing…</div>
+      )}
+
       {/* Events grid */}
       {!isLoading && events.length > 0 && (
         <>
@@ -184,8 +219,8 @@ function EventsContent() {
         </>
       )}
 
-      {/* Empty state */}
-      {!isLoading && events.length === 0 && (
+      {/* Empty state — only when the API answered successfully with zero rows */}
+      {!isLoading && !isError && events.length === 0 && (
         <div className="text-center py-20">
           <Ticket className="h-14 w-14 text-dark-600 mx-auto mb-4" />
           <h3 className="text-xl font-medium mb-2">

@@ -1,8 +1,11 @@
+import { createHash } from 'crypto';
 import { PrismaClient, SeatStatus, BookingStatus, PaymentStatus, PaymentProviderType } from '@prisma/client';
 import { createBookingReference } from '../../utils/booking-reference';
 import { SeatConflictError, ConflictError, ValidationError, NotFoundError, PaymentError } from '../../utils/errors';
 import { logger } from '../../utils/logger';
-import { getRedis } from '../../plugins/redis';
+import { cacheDel } from '../../plugins/redis-safe';
+import { recordBookingMetric } from '../../plugins/booking-metrics';
+import { bumpEventsListVersion } from '../events/events.cache';
 import { config } from '../../config/index';
 import { getPaymentProvider, PaymentIntent } from '../payments/payments.service';
 import { enqueueBookingConfirmationEmail, enqueueBookingCancellationEmail } from '../email/email.worker';
@@ -55,6 +58,73 @@ export interface BookingResult {
   };
 }
 
+// ─── Idempotency (Postgres-backed) ───────────────────────────────────────────
+// Previously idempotent replays were cached in Redis with no expiry-checking
+// and vanished on Redis restarts. IdempotencyKeys live in Postgres now (the
+// model already existed), so replays survive cache outages and restarts.
+
+function idempotencyRequestHash(input: BookSeatsInput): string {
+  return createHash('sha256').update(JSON.stringify({
+    userId: input.userId,
+    eventId: input.eventId,
+    seatIds: [...input.seatIds].sort(),
+  })).digest('hex').slice(0, 32);
+}
+
+/** Returns the stored booking result for a replayed idempotent request. */
+async function findIdempotentBooking(
+  idempotencyKey: string,
+  input: BookSeatsInput,
+): Promise<BookingResult | undefined> {
+  try {
+    const existing = await prisma.idempotencyKey.findUnique({ where: { key: idempotencyKey } });
+    if (!existing) return undefined;
+    if (existing.expiresAt < new Date()) {
+      await prisma.idempotencyKey.delete({ where: { key: idempotencyKey } });
+      return undefined;
+    }
+    if (existing.requestHash !== idempotencyRequestHash(input)) {
+      throw new ConflictError('Idempotency key already used with a different request');
+    }
+    return existing.responseBody as unknown as BookingResult;
+  } catch (err) {
+    if (err instanceof ConflictError) throw err;
+    logger.warn({ idempotencyKey, errMessage: err instanceof Error ? err.message : String(err) }, 'Idempotency lookup failed — proceeding without it');
+    return undefined;
+  }
+}
+
+/** Persists a booking result under its idempotency key after commit. */
+async function persistIdempotencyKey(
+  idempotencyKey: string,
+  input: BookSeatsInput,
+  result: BookingResult,
+): Promise<void> {
+  try {
+    await prisma.idempotencyKey.upsert({
+      where: { key: idempotencyKey },
+      create: {
+        key: idempotencyKey,
+        requestHash: idempotencyRequestHash(input),
+        responseStatus: 201,
+        responseBody: JSON.parse(JSON.stringify(result)),
+        expiresAt: new Date(Date.now() + config.booking.idempotencyExpiryS * 1000),
+      },
+      update: {}, // first-write-wins — a replay must never overwrite
+    });
+  } catch (err) {
+    logger.warn({ idempotencyKey, errMessage: err instanceof Error ? err.message : String(err) }, 'Idempotency persist failed (non-fatal)');
+  }
+}
+
+/** Deletes expired idempotency keys. Called by the maintenance loop. */
+export async function purgeExpiredIdempotencyKeys(): Promise<number> {
+  const res = await prisma.idempotencyKey.deleteMany({
+    where: { expiresAt: { lt: new Date() } },
+  });
+  return res.count;
+}
+
 // ─── Create Booking ─────────────────────────────────────────────────────────
 
 export async function createBooking(input: BookSeatsInput): Promise<BookingResult> {
@@ -71,20 +141,14 @@ export async function createBooking(input: BookSeatsInput): Promise<BookingResul
   // Deduplicate and sort seat IDs for deterministic lock ordering
   const uniqueSeatIds = [...new Set(seatIds)].sort();
 
-  // 2. Check idempotency
+  // 2. Check idempotency — stored in Postgres (authoritative), not Redis
   if (idempotencyKey) {
-    const redis = getRedis();
-    const existing = await redis.get(`idempotency:${idempotencyKey}`);
-    if (existing) {
-      const parsed = JSON.parse(existing);
-      logger.info({ idempotencyKey, bookingId: parsed.bookingId }, 'Idempotent request — returning cached result');
-      return parsed;
-    }
+    const replayed = await findIdempotentBooking(idempotencyKey, input);
+    if (replayed) return replayed;
   }
 
-  // 3. Increment booking attempt metric
-  const redis = getRedis();
-  await redis.incr('metrics:booking:attempts');
+  // 3. Increment booking attempt metric (Postgres; never fails the flow)
+  recordBookingMetric('attempts');
 
   // 4. Execute booking transaction
   logger.info({ userId, eventId, seatCount: uniqueSeatIds.length }, 'Starting booking transaction');
@@ -128,7 +192,7 @@ export async function createBooking(input: BookSeatsInput): Promise<BookingResul
       const unavailableSeats = seats.filter((s) => s.status !== SeatStatus.AVAILABLE);
       if (unavailableSeats.length > 0) {
         const seatNumbers = unavailableSeats.map((s) => s.seat_number);
-        await redis.incr('metrics:booking:conflicts');
+        recordBookingMetric('conflicts');
         logger.info(
           { userId, eventId, unavailableSeats: seatNumbers },
           'Booking conflict — seats unavailable',
@@ -249,20 +313,15 @@ export async function createBooking(input: BookSeatsInput): Promise<BookingResul
     },
   );
 
-  // 5. Post-commit: cache idempotency key
+  // 5. Post-commit: persist idempotency key in Postgres (authoritative)
   if (idempotencyKey) {
-    await redis.setex(
-      `idempotency:${idempotencyKey}`,
-      config.booking.idempotencyExpiryS,
-      JSON.stringify(result),
-    );
+    await persistIdempotencyKey(idempotencyKey, input, result);
   }
 
-  // 6. Post-commit: increment success metric & invalidate cache
-  await redis.incr('metrics:booking:success');
-  await redis.del(`event:${eventId}:availability`);
-  await redis.del(`event:${eventId}`);
-  await redis.del('events:list');
+  // 6. Post-commit: increment success metric & invalidate event caches
+  recordBookingMetric('success');
+  await cacheDel(`event:${eventId}:availability`, `event:${eventId}`);
+  await bumpEventsListVersion();
 
   // 7. Queue background jobs (email + analytics)
   try {
@@ -471,11 +530,10 @@ export async function cancelBooking(bookingId: string, userId: string): Promise<
     logger.error({ err }, 'Failed to broadcast seat release');
   }
 
-  // Invalidate cache
-  const redis = getRedis();
-  await redis.del(`event:${booking.eventId}:availability`);
-  await redis.del(`event:${booking.eventId}`);
-  await redis.incr('metrics:booking:cancellations');
+  // Invalidate caches
+  await cacheDel(`event:${booking.eventId}:availability`, `event:${booking.eventId}`);
+  await bumpEventsListVersion();
+  recordBookingMetric('cancellations');
 
   logger.info({ bookingId, userId }, 'Booking cancelled');
 }

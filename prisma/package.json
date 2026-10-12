@@ -7,6 +7,8 @@
     "migrate": "prisma migrate dev",
     "migrate:prod": "prisma migrate deploy",
     "seed": "tsx seed.ts",
+    "validate:images": "tsx validate-images.ts",
+    "validate:images:db": "tsx validate-images.ts --db",
     "reset": "prisma migrate reset --force",
     "studio": "prisma studio",
     "typecheck": "tsc --noEmit"
@@ -15,6 +17,7 @@
     "@prisma/client": "^6.0.0"
   },
   "devDependencies": {
+    "@types/node": "^20",
     "prisma": "^6.0.0",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0"

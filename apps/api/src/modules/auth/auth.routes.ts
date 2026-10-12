@@ -136,7 +136,9 @@ async function sendAuthEmail(to: string, message: { subject: string; html: strin
 export async function authRoutes(app: FastifyInstance) {
   // ── POST /api/v1/auth/signup ────────────────────────────────────────────
   // Creates an unverified account and emails a verification link.
-  app.post('/api/v1/auth/signup', async (request, reply) => {
+  // D.4 — Stricter per-route limits: credential/abuse-prone endpoints get
+  // their own small in-memory buckets (independent of the general 100/min).
+  app.post('/api/v1/auth/signup', { config: { rateLimit: { max: 5, timeWindow: '1 minute' } } }, async (request, reply) => {
     const body = signupSchema.parse(request.body);
     const email = body.email.toLowerCase();
 
@@ -153,11 +155,17 @@ export async function authRoutes(app: FastifyInstance) {
       },
     });
 
-    // Generate + store verification token
+    // Generate + store verification token in Redis (short-lived, security
+    // data). If Redis is down the signup itself must not fail — we log and
+    // still create the account; the user can use resend-verification later.
     const token = generateToken();
-    const redis = getRedis();
-    await redis.setex(verifyKey(email), VERIFY_TTL_S, sha256(token));
-    await redis.setex(verifyRateKey(email), 2, '1'); // tiny anti-spam guard
+    try {
+      const redis = getRedis();
+      await redis.setex(verifyKey(email), VERIFY_TTL_S, sha256(token));
+      await redis.setex(verifyRateKey(email), 2, '1'); // tiny anti-spam guard
+    } catch (err) {
+      logger.error({ errMessage: err instanceof Error ? err.message : String(err) }, 'Could not store verification token in Redis (signup still succeeded)');
+    }
 
     // Send verification email (link points at the frontend page)
     const verifyUrl = `${config.appUrl}/verify-email?token=${token}&email=${encodeURIComponent(email)}`;
@@ -184,8 +192,13 @@ export async function authRoutes(app: FastifyInstance) {
       throw new AppError(400, 'EMAIL_REQUIRED', 'Email is required to verify your account');
     }
 
-    const redis = getRedis();
-    const stored = await redis.get(verifyKey(targetEmail));
+    let stored: string | null = null;
+    try {
+      const redis = getRedis();
+      stored = await redis.get(verifyKey(targetEmail));
+    } catch (err) {
+      logger.error({ errMessage: err instanceof Error ? err.message : String(err) }, 'Could not read verification token from Redis');
+    }
     if (!stored) {
       throw new AppError(400, 'TOKEN_EXPIRED', 'This verification link has expired. Please request a new one.');
     }
@@ -199,7 +212,12 @@ export async function authRoutes(app: FastifyInstance) {
     }
 
     await prisma.user.update({ where: { id: user.id }, data: { emailVerified: true } });
-    await redis.del(verifyKey(targetEmail));
+    try {
+      const redis = getRedis();
+      await redis.del(verifyKey(targetEmail));
+    } catch (err) {
+      logger.warn({ errMessage: err instanceof Error ? err.message : String(err) }, 'Could not delete verification token (already verified in DB)');
+    }
 
     const token = signToken({ id: user.id, email: user.email, name: user.name, role: user.role });
 
@@ -214,10 +232,9 @@ export async function authRoutes(app: FastifyInstance) {
   });
 
   // ── POST /api/v1/auth/resend-verification ───────────────────────────────
-  app.post('/api/v1/auth/resend-verification', async (request, reply) => {
+  app.post('/api/v1/auth/resend-verification', { config: { rateLimit: { max: 3, timeWindow: '1 minute' } } }, async (request, reply) => {
     const body = resendSchema.parse(request.body);
     const email = body.email.toLowerCase();
-    const redis = getRedis();
 
     const user = await prisma.user.findUnique({ where: { email } });
     if (!user) {
@@ -230,17 +247,43 @@ export async function authRoutes(app: FastifyInstance) {
       return;
     }
 
-    const recent = await redis.get(verifyRateKey(email));
-    if (recent) {
-      throw new AppError(429, 'RATE_LIMITED', 'Please wait a minute before requesting another email');
+    let redis: ReturnType<typeof getRedis> | null = null;
+    let redisFailed = false;
+    try {
+      redis = getRedis();
+      const recent = await redis.get(verifyRateKey(email));
+      if (recent) {
+        throw new AppError(429, 'RATE_LIMITED', 'Please wait a minute before requesting another email');
+      }
+    } catch (err) {
+      if (err instanceof AppError) throw err;
+      redisFailed = true;
+      logger.error({ errMessage: err instanceof Error ? err.message : String(err) }, 'Resend-verification rate-limit check failed (degraded: allowing)');
     }
-
     const token = generateToken();
-    await redis.setex(verifyKey(email), VERIFY_TTL_S, sha256(token));
-    await redis.setex(verifyRateKey(email), RESEND_RATE_S, '1');
+    try {
+      if (redis && !redisFailed) {
+        await redis.setex(verifyKey(email), VERIFY_TTL_S, sha256(token));
+        await redis.setex(verifyRateKey(email), RESEND_RATE_S, '1');
+      } else if (redisFailed) {
+        redisFailed = true; // handled by the Postgres fallback below
+      }
+    } catch (err) {
+      redisFailed = true;
+      logger.error({ errMessage: err instanceof Error ? err.message : String(err) }, 'Could not store resend token in Redis');
+    }
 
     const verifyUrl = `${config.appUrl}/verify-email?token=${token}&email=${encodeURIComponent(email)}`;
     const sent = await sendAuthEmail(email, verifyEmailTemplate(user.name, verifyUrl));
+
+    if (redisFailed) {
+      // Postgres fallback for verification tokens too
+      await prisma.user.update({
+        where: { id: user.id },
+        data: { resetTokenHash: sha256(token), resetTokenExpiresAt: new Date(Date.now() + 15 * 60 * 1000) },
+      });
+      logger.error('Redis unavailable — verification token stored in Postgres fallback');
+    }
 
     reply.send({
       success: true,
@@ -249,7 +292,7 @@ export async function authRoutes(app: FastifyInstance) {
   });
 
   // ── POST /api/v1/auth/login ─────────────────────────────────────────────
-  app.post('/api/v1/auth/login', async (request, reply) => {
+  app.post('/api/v1/auth/login', { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } }, async (request, reply) => {
     const body = loginSchema.parse(request.body);
     const email = body.email.toLowerCase();
 
@@ -279,10 +322,9 @@ export async function authRoutes(app: FastifyInstance) {
   });
 
   // ── POST /api/v1/auth/forgot-password ───────────────────────────────────
-  app.post('/api/v1/auth/forgot-password', async (request, reply) => {
+  app.post('/api/v1/auth/forgot-password', { config: { rateLimit: { max: 3, timeWindow: '1 minute' } } }, async (request, reply) => {
     const body = forgotPasswordSchema.parse(request.body);
     const email = body.email.toLowerCase();
-    const redis = getRedis();
 
     const user = await prisma.user.findUnique({ where: { email } });
     if (!user) {
@@ -291,14 +333,38 @@ export async function authRoutes(app: FastifyInstance) {
       return;
     }
 
-    const recent = await redis.get(resetRateKey(email));
-    if (recent) {
-      throw new AppError(429, 'RATE_LIMITED', 'Please wait a minute before requesting another reset email');
+    let redisFailed = false;
+    try {
+      const redis = getRedis();
+      const recent = await redis.get(resetRateKey(email));
+      if (recent) {
+        throw new AppError(429, 'RATE_LIMITED', 'Please wait a minute before requesting another reset email');
+      }
+    } catch (err) {
+      if (err instanceof AppError) throw err;
+      redisFailed = true;
     }
 
     const token = generateToken();
-    await redis.setex(resetKey(email), RESET_TTL_S, sha256(token));
-    await redis.setex(resetRateKey(email), RESET_RATE_S, '1');
+    try {
+      const redis = getRedis();
+      await redis.setex(resetKey(email), RESET_TTL_S, sha256(token));
+      await redis.setex(resetRateKey(email), RESET_RATE_S, '1');
+    } catch (err) {
+      redisFailed = true;
+    }
+
+    if (redisFailed) {
+      // Postgres fallback so a Redis outage can't lock users out of reset.
+      await prisma.user.update({
+        where: { id: user.id },
+        data: {
+          resetTokenHash: sha256(token),
+          resetTokenExpiresAt: new Date(Date.now() + RESET_TTL_S * 1000),
+        },
+      });
+      logger.error('Redis unavailable — reset token stored in Postgres fallback');
+    }
 
     const resetUrl = `${config.appUrl}/reset-password?token=${token}&email=${encodeURIComponent(email)}`;
     await sendAuthEmail(email, resetPasswordTemplate(resetUrl));
@@ -307,20 +373,11 @@ export async function authRoutes(app: FastifyInstance) {
   });
 
   // ── POST /api/v1/auth/reset-password ────────────────────────────────────
-  app.post('/api/v1/auth/reset-password', async (request, reply) => {
+  app.post('/api/v1/auth/reset-password', { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } }, async (request, reply) => {
     const body = resetPasswordSchema.parse(request.body);
     const email = ((request.query as any)?.email || (request.body as any)?.email || '').toLowerCase();
     if (!email) {
       throw new AppError(400, 'EMAIL_REQUIRED', 'Email is required to reset your password');
-    }
-
-    const redis = getRedis();
-    const stored = await redis.get(resetKey(email));
-    if (!stored) {
-      throw new AppError(400, 'TOKEN_EXPIRED', 'This reset link has expired. Please request a new one.');
-    }
-    if (stored !== sha256(body.token)) {
-      throw new AppError(400, 'TOKEN_INVALID', 'Invalid reset link.');
     }
 
     const user = await prisma.user.findUnique({ where: { email } });
@@ -328,11 +385,47 @@ export async function authRoutes(app: FastifyInstance) {
       throw new AppError(404, 'USER_NOT_FOUND', 'No account found for this email');
     }
 
+    // Token may live in Redis (normal) or Postgres (Redis-outage fallback)
+    let stored: string | null | undefined = null;
+    let postgresFallback = false;
+    try {
+      const redis = getRedis();
+      stored = await redis.get(resetKey(email));
+    } catch {
+      postgresFallback = true;
+    }
+    if (!stored && user.resetTokenHash) {
+      postgresFallback = true;
+      stored = user.resetTokenHash;
+    }
+    if (!stored || postgresFallback) {
+      if (!stored) {
+        throw new AppError(400, 'TOKEN_EXPIRED', 'This reset link has expired. Please request a new one.');
+      }
+    }
+    if (stored !== sha256(body.token)) {
+      throw new AppError(400, 'TOKEN_INVALID', 'Invalid reset link.');
+    }
+    if (postgresFallback && user.resetTokenExpiresAt && user.resetTokenExpiresAt < new Date()) {
+      throw new AppError(400, 'TOKEN_EXPIRED', 'This reset link has expired. Please request a new one.');
+    }
+
     await prisma.user.update({
       where: { id: user.id },
-      data: { passwordHash: hashPassword(body.password) },
+      data: {
+        passwordHash: hashPassword(body.password),
+        resetTokenHash: null,
+        resetTokenExpiresAt: null,
+      },
     });
-    await redis.del(resetKey(email));
+    if (!postgresFallback) {
+      try {
+        const redis = getRedis();
+        await redis.del(resetKey(email));
+      } catch {
+        // non-fatal
+      }
+    }
 
     reply.send({ success: true, data: { message: 'Password updated. You can now log in with your new password.' } });
   });

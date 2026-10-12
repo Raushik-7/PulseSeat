@@ -1,6 +1,8 @@
 import { FastifyInstance } from 'fastify';
 import { prisma } from '../../plugins/prisma';
-import { getRedis } from '../../plugins/redis';
+import { cacheDel } from '../../plugins/redis-safe';
+import { getBookingMetrics } from '../../plugins/booking-metrics';
+import { bumpEventsListVersion } from '../events/events.cache';
 import { requireAdmin } from '../../middleware/auth';
 
 export async function adminRoutes(app: FastifyInstance) {
@@ -29,12 +31,7 @@ export async function adminRoutes(app: FastifyInstance) {
       prisma.seat.count({ where: { status: 'BOOKED' } }),
     ]);
 
-    const redis = getRedis();
-    const [bookingAttempts, bookingSuccess, bookingConflicts] = await Promise.all([
-      redis.get('metrics:booking:attempts'),
-      redis.get('metrics:booking:success'),
-      redis.get('metrics:booking:conflicts'),
-    ]);
+    const bookingMetrics = await getBookingMetrics();
 
     const successRate =
       confirmedBookings + failedBookings > 0
@@ -55,9 +52,9 @@ export async function adminRoutes(app: FastifyInstance) {
         seatsBooked,
         totalSeats: seatsAvailable + seatsBooked,
         metrics: {
-          bookingAttempts: parseInt(bookingAttempts || '0', 10),
-          bookingSuccess: parseInt(bookingSuccess || '0', 10),
-          bookingConflicts: parseInt(bookingConflicts || '0', 10),
+          bookingAttempts: bookingMetrics.attempts,
+          bookingSuccess: bookingMetrics.success,
+          bookingConflicts: bookingMetrics.conflicts,
         },
       },
     });
@@ -215,9 +212,8 @@ export async function adminRoutes(app: FastifyInstance) {
       data: { status: 'PUBLISHED' },
     });
 
-    const redis = getRedis();
-    await redis.del(`event:${eventId}:availability`);
-    await redis.del(`event:${eventId}`);
+    await cacheDel(`event:${eventId}:availability`, `event:${eventId}`);
+    await bumpEventsListVersion();
 
     reply.send({ success: true, message: 'All seats reset to AVAILABLE' });
   });

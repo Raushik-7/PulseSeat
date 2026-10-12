@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, Suspense } from 'react';
+import { useState, useEffect, useRef, Suspense } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import {
@@ -71,19 +71,29 @@ function CheckoutContent() {
     return v;
   };
 
+  // Prevent overlapping booking submissions: double-clicking "Pay" must not
+  // fire two POST /bookings against the same hold.
+  const payingRef = useRef(false);
+
   const handlePayment = async () => {
+    if (payingRef.current) return; // a payment is already in flight
     if (!token || !eventId || seatIds.length === 0) return;
 
+    payingRef.current = true;
     setStep('processing');
     setLoading(true);
 
     try {
-      // 1. Create the booking
-      const idempotencyKey = `checkout_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+      // 1. Create the booking — key derived from content, not wall-clock, so a
+      // genuine network retry of this same attempt reuses the same key and the
+      // server-side idempotency layer returns the original booking instead
+      // of creating a second one.
+      const idempotencyKey = `checkout_${eventId}_${seatIds.slice().sort().join('-').slice(0, 180)}`;
+      const idempotencyKeyHash = idempotencyKey.length > 200 ? `checkout_${eventId}_${crypto.randomUUID?crypto.randomUUID():Date.now()}` : idempotencyKey;
       const bookingResult: any = await apiClient.createBooking(
         { eventId, seatIds },
         token,
-        idempotencyKey,
+        idempotencyKeyHash,
       );
 
       const newBookingId = bookingResult.data.bookingId;
@@ -106,6 +116,7 @@ function CheckoutContent() {
       toast({ title: message, type: 'error' });
       setStep('summary');
     } finally {
+      payingRef.current = false;
       setLoading(false);
     }
   };

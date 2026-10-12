@@ -177,6 +177,10 @@ pnpm db:migrate
 # Seed database (20 Indian events, 3 unique images each, full seat maps, demo users)
 pnpm db:seed
 
+# Validate event images (uniqueness + every URL reachable; --db reports live DB stats)
+pnpm --filter @pulseseat/prisma validate:images
+pnpm --filter @pulseseat/prisma validate:images:db
+
 # Start development servers (web :3000, api :3001)
 pnpm dev
 ```
@@ -324,6 +328,7 @@ pulseseat/
 - [Load Testing](docs/load-testing.md)
 - [Load Test Report (measured results)](PULSESEAT_LOAD_TEST_REPORT.md)
 - [Deployment Guide](docs/deployment.md)
+- [Ops Runbook (incidents, outages, health probes)](docs/ops-runbook.md)
 - [Free-Tier Deployment Walkthrough (step-by-step)](docs/free-tier-deployment-walkthrough.md)
 
 ## 🛡 Security

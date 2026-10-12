@@ -8,6 +8,7 @@ generator client {
 datasource db {
   provider  = "postgresql"
   url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
 }
 
 // ─── Enums ──────────────────────────────────────────────────────────────────
@@ -63,6 +64,11 @@ model User {
   emailVerified Boolean @default(false) @map("email_verified")
   role         UserRole @default(USER)
   avatarUrl    String?  @map("avatar_url")
+  // Password-reset fallback: when Redis is unavailable, reset (and, reused,
+  // email-verification) tokens persist here so users are never locked out of
+  // account recovery by a cache outage.
+  resetTokenHash      String?   @map("reset_token_hash")
+  resetTokenExpiresAt DateTime? @map("reset_token_expires_at")
   createdAt    DateTime @default(now()) @map("created_at")
   updatedAt    DateTime @updatedAt @map("updated_at")
 
@@ -196,6 +202,16 @@ model IdempotencyKey {
   @@index([key])
   @@index([expiresAt])
   @@map("idempotency_keys")
+}
+
+// Booking-funnel counters managed via raw SQL UPSERTs (see
+// apps/api/src/plugins/booking-metrics.ts). Replaces per-booking Redis INCRs.
+model MetricCounter {
+  metric    String   @id
+  n         Int      @default(0)
+  updatedAt DateTime @default(now()) @map("updated_at")
+
+  @@map("metric_counters")
 }
 
 model AuditLog {

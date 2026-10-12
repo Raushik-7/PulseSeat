@@ -12,8 +12,9 @@ const createBookingSchema = z.object({
 });
 
 export async function bookingsRoutes(app: FastifyInstance) {
-  // POST /api/v1/bookings — Create a booking (the concurrency-critical endpoint)
-  app.post('/api/v1/bookings', { preHandler: [requireAuth] }, async (request, reply) => {
+  // POST /api/v1/bookings — Create a booking (the concurrency-critical endpoint).
+  // Stricter rate limit: protects seat inventory from scripted hammering.
+  app.post('/api/v1/bookings', { preHandler: [requireAuth], config: { rateLimit: { max: 20, timeWindow: '1 minute' } } }, async (request, reply) => {
     const user = (request as any).user;
     const body = createBookingSchema.parse(request.body);
     const idempotencyKey = request.headers['idempotency-key'] as string | undefined;

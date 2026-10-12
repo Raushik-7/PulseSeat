@@ -47,13 +47,42 @@ Everything downstream imports from GitHub, so this comes first.
    postgresql://postgres:<password>@db.<project-ref>.supabase.co:5432/postgres
    ```
 
-**Create the schema** — locally, from the project root (this runs the real migration, not `db push`):
+**Create the schema** — locally, **from the `prisma/` folder** (this runs the real migration, not `db push`).
+
+> **Why `prisma/`?** The Prisma CLI + `tsx` are installed in `prisma/node_modules`, and the seed script resolves there. Running from the repo root makes `npx` try to download a random Prisma version and fail. Bonus: Prisma only auto-loads `.env` from the **current directory**, so from `prisma/` your root `.env` (local Docker URLs) is ignored — the connection strings below must come from the shell.
+
+> **Windows note:** inline env vars (`VAR=value npx …`) only work in **Git Bash**. On **PowerShell** use `$env:` assignments — `set VAR=…` is cmd-only and does **not** pass to `npx`.
+
+**PowerShell (recommended on Windows):**
+```powershell
+cd D:\PulseSeat\prisma
+$env:DATABASE_URL = "<pooled url>"
+$env:DIRECT_URL   = "<direct url>"
+npx prisma migrate deploy
+Remove-Item Env:DIRECT_URL -ErrorAction SilentlyContinue   # optional cleanup
+```
+
+**Git Bash:**
 ```bash
 cd prisma
 DATABASE_URL="<pooled url>" DIRECT_URL="<direct url>" npx prisma migrate deploy
-DATABASE_URL="<pooled url>" DIRECT_URL="<direct url>" npx prisma db seed   # optional demo data
 ```
-Verify in Supabase → **Table Editor**: `events`, `seats`, `users`, `bookings` exist with 20 events (if you seeded).
+
+> **Why two URLs?** `DATABASE_URL` (pooler, port `6543`) is what the deployed **API** uses at runtime. `DIRECT_URL` (port `5432`) is what Prisma uses for **migrations** — the schema pins it via `directUrl = env("DIRECT_URL")`, and it must be set or you'll get `P1012 Environment variable not found`. Both are shell-only here — your local `.env` file is never modified.
+>
+> **Windows/IPv4 tip:** if the direct `db.<ref>.supabase.co:5432` URL fails with `P1001 can't reach database` (many home networks are IPv4-only and that host is IPv6-only), use the **session pooler** as `DIRECT_URL` instead — same pooler host as your `DATABASE_URL` but port `5432` and username `postgres.<project-ref>`:
+> `postgresql://postgres.<project-ref>:<password>@aws-0-<region>.pooler.supabase.com:5432/postgres`
+
+**Seed the events (production-safe, idempotent — run any time):**
+```powershell
+cd D:\PulseSeat\prisma
+$env:DATABASE_URL = "<pooled url>"   # same pooled URL as above
+pnpm seed
+pnpm validate:images:db   # prints the full events/images/seats report from the DB
+```
+The seed is **additive and idempotent**: it never deletes anything (no `TRUNCATE`, no `migrate reset`), upserts events by slug, creates seats only for brand-new events (existing bookings untouched), and skips load-test users unless `SEED_LOAD_USERS=1`. Safe to run repeatedly and against the live Supabase DB.
+
+Verify in Supabase → **Table Editor**: `events`, `seats`, `users`, `bookings` exist with 20 events. The deployed site shows them within ~30s (Redis cache TTL).
 
 ---
 
@@ -62,7 +91,15 @@ Verify in Supabase → **Table Editor**: `events`, `seats`, `users`, `bookings` 
 1. upstash.com → **Sign up free** → **Create database** (name `pulseseat`, same region as Supabase, **Regional** type).
 2. Open the database → **REST… no — connect via `REDIS_URL`:** in the **Details** tab find **Endpoint + Port** and copy the connection string shown under "Connect with Redis client", or build it:
    `rediss://default:<password>@<endpoint>.upstash.io:6379`
-3. That URL is your **`REDIS_URL`**. (Upstash free tier = 10k commands/day — fine for a demo.)
+3. That URL is your **`REDIS_URL`**. (Upstash free tier = 500k commands/MONTH.)
+
+   **2026-10 quota notes:** the app now treats Redis strictly as an optional
+   cache — every public read falls back to Postgres when Redis fails
+   (`apps/api/src/plugins/redis-safe.ts`), rate limiting, readiness checks and
+   booking metrics all use ZERO Redis commands, and event-list/detail caches
+   have 60s TTLs. UptimeRobot-style probe storms and monitor PINGs no longer
+   burn quota. If you still exhaust it, the site keeps working uncached — but
+   watch for `Redis unavailable — serving reads from Postgres` in Render logs.
 
 ---
 
@@ -79,7 +116,7 @@ The API is a long-running Fastify + Socket.io + BullMQ server — it needs a pla
    - **Start Command:** `npm run start`
 3. **Variables** tab → add (values from Phase 1/2):
    ```
-   DATABASE_URL=<pooled Supabase URL>
+   DATABASE_URL=<pooled Supabase URL with ?pgbouncer=true>   # REQUIRED — prevents "prepared statement does not exist" errors
    DIRECT_URL=<direct Supabase URL>
    REDIS_URL=<Upstash rediss URL>
    JWT_SECRET=<openssl rand -hex 48 output>
@@ -107,10 +144,18 @@ The API is a long-running Fastify + Socket.io + BullMQ server — it needs a pla
 
 ```bash
 curl https://<api-url>/health/ready
-# {"status":"ready","checks":{"postgres":{"status":"healthy"},...}}
+# {"status":"ready","checks":{"postgres":{"status":"healthy","latencyMs":..},"publishedEvents":N}}
 curl "https://<api-url>/api/v1/events?limit=1"
 # {"success":true,"data":[...20 events...]}
 ```
+
+`/health/ready` checks **Postgres only** (zero Redis commands — safe for
+external monitors without burning Upstash quota). `/health/deps` reports
+Redis detail for manual incident diagnosis. Use Render's health-check path
+`/health/ready` and set the check cadence to 30s+.
+
+**Navigation/ops tip:** for day-to-day incident triage (cards disappear,
+Upstash quota, Supabase pause, Render sleeps), see `docs/ops-runbook.md`.
 
 ---
 
@@ -186,6 +231,8 @@ The API must accept browser requests from the Vercel domain:
 | Web deploys but "Network error" / API calls fail | `NEXT_PUBLIC_API_URL` missing/wrong at build → fix variable on Vercel → **Redeploy** |
 | CORS error in browser console | API's `NEXT_PUBLIC_APP_URL`/`CORS_ORIGINS` don't match the Vercel URL → fix → redeploy API |
 | API crashes at boot: `@prisma/client did not initialize yet` | postinstall didn't run → confirm Root Directory is `/apps/api` and Build Command runs `npm install` |
+| `P1012 Environment variable not found: DATABASE_URL` | Env vars didn't reach Prisma: inline `VAR=… npx …` is Git-Bash-only, and from the repo root `npx prisma` doesn't resolve. `cd prisma` first and use the PowerShell `$env:VAR = "…"` block in Phase 1 — set **both** `DATABASE_URL` *and* `DIRECT_URL` |
+| `P2022 The column X does not exist` while seeding | Supabase schema is older than the code — run the **migrate deploy** block in Phase 1 first (the drift-sync migration adds `email_verified` etc.), then run the seed |
 | `P1001 can't reach database` | `DATABASE_URL` uses the **direct** URL on Supabase → use the **pooler (6543)** URL for `DATABASE_URL` |
 | Emails never arrive | No SMTP set (console-only mode) → check API logs for the link, or add Resend/Postmark vars (Phase 6) |
 | Verification link goes to `http://localhost:3000/...` | API's `NEXT_PUBLIC_APP_URL` is unset/stale → set to the real Vercel URL → redeploy |

@@ -1,6 +1,6 @@
 import { FastifyInstance } from 'fastify';
 import { prisma } from '../../plugins/prisma';
-import { getRedis } from '../../plugins/redis';
+import { cacheGet, cacheSet } from '../../plugins/redis-safe';
 import { NotFoundError } from '../../utils/errors';
 
 export async function seatsRoutes(app: FastifyInstance) {
@@ -8,14 +8,29 @@ export async function seatsRoutes(app: FastifyInstance) {
   app.get('/api/v1/events/:eventId/seats', async (request, reply) => {
     const { eventId } = request.params as { eventId: string };
 
-    // Validate event exists
-    const event = await prisma.event.findFirst({
-      where: { OR: [{ id: eventId }, { slug: eventId }] },
-    });
-    if (!event) throw new NotFoundError('Event', eventId);
+    // Resolve by id OR slug — the UI links to events by slug.
+    // Cache value: `{ id }` on hit, `null` for a verified-missing event
+    // (negative caching), `undefined` on cache miss/failure.
+    const cachedEvent = await cacheGet<{ id: string } | null>(`event-id:${eventId}`);
+    if (cachedEvent === null) throw new NotFoundError('Event', eventId);
+
+    let eventRow: { id: string } | undefined = cachedEvent ?? undefined;
+    if (!eventRow) {
+      eventRow = (await prisma.event.findFirst({
+        where: { OR: [{ id: eventId }, { slug: eventId }] },
+        select: { id: true },
+      })) ?? undefined;
+      if (!eventRow) {
+        // Negative cache so bogus-slug floods don't hammer Postgres
+        await cacheSet(`event-id:${eventId}`, null, 10);
+        throw new NotFoundError('Event', eventId);
+      }
+      await cacheSet(`event-id:${eventId}`, { id: eventRow.id }, 60);
+    }
+    const resolvedEventId = eventRow.id;
 
     const seats = await prisma.seat.findMany({
-      where: { eventId: event.id },
+      where: { eventId: resolvedEventId },
       orderBy: [{ row: 'asc' }, { seatNumber: 'asc' }],
       select: {
         id: true,
@@ -33,12 +48,11 @@ export async function seatsRoutes(app: FastifyInstance) {
   // GET /api/v1/events/:eventId/availability — Optimized availability summary
   app.get('/api/v1/events/:eventId/availability', async (request, reply) => {
     const { eventId } = request.params as { eventId: string };
-    const redis = getRedis();
 
     const cacheKey = `event:${eventId}:availability`;
-    const cached = await redis.get(cacheKey);
+    const cached = await cacheGet<unknown>(cacheKey);
     if (cached) {
-      reply.send(JSON.parse(cached));
+      reply.send(cached);
       return;
     }
 
@@ -86,7 +100,7 @@ export async function seatsRoutes(app: FastifyInstance) {
       },
     };
 
-    await redis.setex(cacheKey, 10, JSON.stringify(result)); // Short TTL for availability
+    await cacheSet(cacheKey, result, 10); // Short TTL — availability is time-sensitive
     reply.send(result);
   });
 }
