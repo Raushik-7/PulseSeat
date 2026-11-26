@@ -1,24 +1,24 @@
 import { FastifyInstance } from 'fastify';
 import { prisma } from '../../plugins/prisma';
+import { pingRedis } from '../../plugins/redis-safe';
+import { getEmailOutboxStats } from '../email/email.outbox';
 import { logger } from '../../utils/logger';
 
 /**
- * Health endpoints — three tiers:
+ * Health endpoints — four tiers, deliberately separated so a keep-alive or
+ * uptime monitor can never burn Redis quota or page on an optional dependency.
  *
- * /health        — process liveness only (no dependencies). Use for Render's
- *                  health check path or any monitoring that should page on a
- *                  dead process.
- * /health/ready  — TRUE readiness: Postgres only. Public event browsing only
- *                  truly needs the database; Redis is an optional cache that
- *                  the data paths degrade without (see plugins/redis-safe.ts).
- *                  This endpoint performs ONE cheap indexed count — no Redis
- *                  commands, so a probe storm can never burn Upstash quota and
- *                  cache outages can never mark a healthy service "down"
- *                  (UptimeRobot watches this endpoint).
- * /health/deps   — Full dependency report (Postgres + up to 2 Redis probes +
- *                  queue summary). query=1 optionally includes Postgres query
- *                  latency. NOT for frequent monitoring — use for manual
- *                  incident diagnosis.
+ * /health        — process liveness only (no dependencies, no Redis).
+ * /health/live   — liveness alias.
+ * /health/ready  — readiness: Postgres only (one indexed count). This is what
+ *                  the external keep-alive and Render's health check should
+ *                  use: ZERO Redis commands. Public browsing only truly needs
+ *                  the database; Redis is an optional cache.
+ * /health/deps   — manual incident diagnosis only: Postgres, ONE breaker-aware
+ *                  Redis PING, and email-outbox depth. Not for frequent polling.
+ *
+ * Redis being unavailable reports `degraded` but never makes readiness fail:
+ * a cache outage must not mark a healthy service "down".
  */
 
 export async function healthRoutes(app: FastifyInstance) {
@@ -61,33 +61,31 @@ export async function healthRoutes(app: FastifyInstance) {
 
   // GET /health/deps — Deep dependency report (for manual diagnosis)
   app.get('/health/deps', async (_request, reply) => {
-    const checks: Record<string, { status: string; latencyMs?: number; error?: string }> = {};
+    const checks: Record<string, unknown> = {};
 
+    let postgresHealthy = false;
     try {
       const start = Date.now();
       await prisma.$queryRaw`SELECT 1`;
       checks.postgres = { status: 'healthy', latencyMs: Date.now() - start };
+      postgresHealthy = true;
     } catch (err: any) {
       checks.postgres = { status: 'unhealthy', error: err?.message ?? 'unknown' };
     }
 
+    // At most ONE PING, skipped entirely while the breaker is open.
+    const redis = await pingRedis();
+    checks.redis = redis;
+
     try {
-      const { getRedis } = await import('../../plugins/redis');
-      const redis = getRedis();
-      // At most 2 commands per deep check (PINGS on pipelined connections).
-      const pipeline = redis.pipeline();
-      pipeline.ping();
-      pipeline.ping();
-      const results = await pipeline.exec() as Array<[null | Error, unknown]>;
-      const failing = results.filter(([, res]) => res instanceof Error).length;
-      checks.redis = failing > 0 ? { status: 'unhealthy', error: `${failing} of 2 ping(s) failed` } : { status: 'healthy' };
-    } catch (err: any) {
-      checks.redis = { status: 'unhealthy', error: err?.message ?? 'unknown' };
+      checks.emailOutbox = await getEmailOutboxStats();
+    } catch {
+      checks.emailOutbox = { status: 'unknown' };
     }
 
-    const allHealthy = Object.values(checks).every((c) => c.status === 'healthy');
-    reply.status(allHealthy ? 200 : 503).send({
-      status: allHealthy ? 'ready' : 'degraded',
+    // Only Postgres decides the status code — it is the sole hard dependency.
+    reply.status(postgresHealthy ? 200 : 503).send({
+      status: postgresHealthy && redis.status === 'ok' ? 'ready' : 'degraded',
       timestamp: new Date().toISOString(),
       checks,
     });

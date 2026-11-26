@@ -92,20 +92,25 @@ Verify in Supabase → **Table Editor**: `events`, `seats`, `users`, `bookings` 
 2. Open the database → **REST… no — connect via `REDIS_URL`:** in the **Details** tab find **Endpoint + Port** and copy the connection string shown under "Connect with Redis client", or build it:
    `rediss://default:<password>@<endpoint>.upstash.io:6379`
 3. That URL is your **`REDIS_URL`**. (Upstash free tier = 500k commands/MONTH.)
+   Any Redis-compatible provider works — only this URL changes on migration.
+   Set `REDIS_ENABLED=false` to run with no Redis at all (reads go straight to
+   Postgres).
 
-   **2026-10 quota notes:** the app now treats Redis strictly as an optional
-   cache — every public read falls back to Postgres when Redis fails
+   **Quota notes:** the app treats Redis strictly as an optional cache — every
+   public read falls back to Postgres when Redis fails
    (`apps/api/src/plugins/redis-safe.ts`), rate limiting, readiness checks and
-   booking metrics all use ZERO Redis commands, and event-list/detail caches
-   have 60s TTLs. UptimeRobot-style probe storms and monitor PINGs no longer
-   burn quota. If you still exhaust it, the site keeps working uncached — but
-   watch for `Redis unavailable — serving reads from Postgres` in Render logs.
+   booking metrics use ZERO Redis commands, and event-list/detail caches have
+   60s TTLs. There is no queue worker: the BullMQ `email` worker that used to
+   poll Redis 24/7 (`BZPOPMIN` every 5s + an `EVALSHA` per poll, with no traffic
+   at all) was replaced by a Postgres outbox. So idle cost is now **0 commands**
+   — commands are only spent serving requests. If the quota still runs out, the
+   site keeps working uncached; watch for `Redis circuit OPEN` in Render logs.
 
 ---
 
 ## Phase 3 — API: Railway or Render (20 min)
 
-The API is a long-running Fastify + Socket.io + BullMQ server — it needs a platform that keeps processes alive (Vercel cannot host it). Both options below import the **same** GitHub repo and only build `apps/api`.
+The API is a long-running Fastify + Socket.io server (plus a 30s maintenance loop for holds, housekeeping and the email outbox) — it needs a platform that keeps processes alive (Vercel cannot host it). Both options below import the **same** GitHub repo and only build `apps/api`.
 
 ### Option A — Railway (recommended, WebSocket-native)
 

@@ -10,10 +10,13 @@ Client (Browser)
 Nginx (Reverse Proxy)
     ↓
 Fastify API Server
-    ├── Redis (Cache + Rate Limiting + Idempotency)
-    ├── PostgreSQL (Source of Truth)
-    └── BullMQ (Background Jobs via Redis)
+    ├── Redis (OPTIONAL cache + short-lived auth tokens)
+    └── PostgreSQL (Source of Truth + email outbox)
 ```
+
+There are no Redis-backed background workers. The API process issues Redis
+commands only while serving requests — never while idle (see
+[redis-audit.md](./redis-audit.md)).
 
 ## Components
 
@@ -37,19 +40,21 @@ Fastify API Server
 - UNIQUE constraints as safety nets
 - Strategic indexes for query performance
 
-### Redis
-- Response caching (event listings, availability)
-- Rate limiting (sliding window)
-- Idempotency key storage
-- BullMQ job queue backend
+### Redis (optional)
+- Response caching (event listings, availability, event-id lookups)
+- Short-lived hashed auth tokens, with a Postgres fallback
 - **Never** the source of truth for booking state
+- **Optional**: every call goes through `plugins/redis-safe.ts`, which fails
+  fast, degrades to Postgres, and opens a circuit breaker after repeated
+  failures (quota exhaustion, provider outage). `REDIS_ENABLED=false` disables
+  it entirely.
 
-### BullMQ
-- Booking confirmation emails
-- Invoice generation
-- Seat hold expiration
-- Analytics aggregation
-- Exponential backoff retries
+### Email outbox (PostgreSQL)
+- Booking confirmation / cancellation emails
+- Rows are claimed with `FOR UPDATE SKIP LOCKED`, retried with exponential
+  backoff, capped and pruned — delivered by the 30s maintenance loop
+- Replaces the previous BullMQ worker, whose idle `BZPOPMIN`/`EVALSHA` polling
+  consumed the Redis quota with no user traffic
 
 ## Request Flow
 
@@ -59,15 +64,15 @@ Fastify API Server
 2. Nginx applies rate limiting
 3. Fastify authenticates JWT
 4. Fastify validates request (Zod)
-5. Redis checks idempotency key
+5. PostgreSQL checks the idempotency key
 6. PostgreSQL BEGIN TRANSACTION
 7. SELECT ... FOR UPDATE (lock seats)
 8. Check all seats are AVAILABLE
 9. INSERT booking record
 10. UPDATE seat status to BOOKED
 11. COMMIT
-12. Redis caches result / invalidates cache
-13. BullMQ queues background jobs
+12. Redis invalidates cache keys (best-effort; failure never fails the booking)
+13. INSERT the confirmation email into `email_outbox` (+ best-effort inline send)
 14. Return 201 Created
 ```
 
@@ -89,12 +94,14 @@ Nginx
   ├── API Instance 2
   └── API Instance 3
          ↓
-      Redis (shared)
+      Redis (shared, optional)
          ↓
     PostgreSQL (shared)
 ```
 
-PostgreSQL remains the consistency anchor. Redis and the application layer are stateless.
+PostgreSQL remains the consistency anchor (including the email outbox, which is
+claimed with `SKIP LOCKED` so every instance can drain it safely). Redis and the
+application layer are stateless.
 
 ### Connection Pooling
 Prisma manages a connection pool to PostgreSQL. For multiple instances, the pool size should be reduced per instance.
@@ -103,7 +110,7 @@ Prisma manages a connection pool to PostgreSQL. For multiple instances, the pool
 
 - JWT-based authentication (HMAC-SHA256)
 - Role-based authorization validated server-side
-- Rate limiting per-user and per-IP
+- Rate limiting per-user and per-IP (in-process `@fastify/rate-limit`; no Redis commands)
 - Input validation on all endpoints
 - No secrets in source control
 - Security headers via Helmet

@@ -5,7 +5,7 @@ import helmet from '@fastify/helmet';
 import rateLimit from '@fastify/rate-limit';
 import { config } from './config/index';
 import { prisma } from './plugins/prisma';
-import { getRedis, closeRedis } from './plugins/redis';
+import { startRedis, closeRedis } from './plugins/redis';
 import { getBookingMetrics } from './plugins/booking-metrics';
 import { logger } from './utils/logger';
 import { errorHandler } from './plugins/error-handler';
@@ -17,7 +17,6 @@ import { adminRoutes } from './modules/admin/admin.routes';
 import { healthRoutes } from './modules/health/health.routes';
 import { paymentsRoutes } from './modules/payments/payments.routes';
 import { initWebSocket } from './plugins/websocket';
-import { startEmailWorker, closeQueues } from './modules/email/email.worker';
 import { startMaintenanceLoop, stopMaintenanceLoop } from './maintenance';
 
 const app = Fastify({
@@ -153,25 +152,10 @@ async function start() {
   // ─── Start Server ────────────────────────────────────────────────────────
 
   try {
-    // Connect to Redis — non-fatal. The API serves all public reads straight
-    // from Postgres when the cache is unreachable (see plugins/redis-safe.ts);
-    // failing startup over an optional cache turns a Redis outage into a full
-    // API outage (that combination is what knocked the live site dark).
-    try {
-      const redis = getRedis();
-      // Kick off connect() but do NOT await it indefinitely — a black-holed
-      // Redis (quota, network) must never block server boot. lazyConnect+
-      // retryStrategy keeps it reconnecting in the background; the first few
-      // cache calls may miss, which is harmless (Postgres serves reads).
-      const connectReady = redis.connect();
-      connectReady
-        .then(() => logger.info('Redis connected'))
-        .catch((err: unknown) =>
-          logger.error({ errMessage: err instanceof Error ? err.message : String(err) }, 'Redis unavailable at startup — continuing in degraded-cache mode (reads fall back to Postgres)'),
-        );
-    } catch (err) {
-      logger.error({ err }, 'Redis client init failed — continuing in degraded-cache mode');
-    }
+    // Redis — optional, non-fatal, never awaited. Public reads fall back to
+    // Postgres when it is unreachable (plugins/redis-safe.ts), so a quota
+    // outage degrades caching rather than taking the API down.
+    startRedis();
 
     // Verify database connection — Postgres IS fatal. No DB = no service.
     await prisma.$queryRaw`SELECT 1`;
@@ -180,8 +164,11 @@ async function start() {
     // Initialize WebSocket gateway
     initWebSocket(app);
 
-    // Start email worker (BullMQ) and the low-frequency maintenance loop
-    startEmailWorker();
+    // One low-frequency maintenance loop: hold expiry, hourly housekeeping,
+    // and the Postgres email outbox drain. There is deliberately NO Redis
+    // worker/queue process — the old BullMQ worker polled Redis continuously
+    // while idle (BZPOPMIN + moveToActive EVALSHA), which consumed the free
+    // Upstash quota without any user traffic.
     startMaintenanceLoop();
 
     await app.listen({ port: config.port, host: config.host });
@@ -198,7 +185,6 @@ async function start() {
   const shutdown = async () => {
     logger.info('Shutting down...');
     await app.close();
-    await closeQueues();
     stopMaintenanceLoop();
     await prisma.$disconnect();
     await closeRedis();

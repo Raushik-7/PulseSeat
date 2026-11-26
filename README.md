@@ -11,25 +11,22 @@ When thousands of users try to buy tickets for the same event simultaneously, na
 ## 🏗 Architecture
 
 ```
-┌──────────┐     ┌──────────┐     ┌──────────┐
-│  Next.js │────▶│ Fastify  │────▶│   Redis  │
-│ Frontend │ WS  │   API    │     │  Cache   │
-└──────────┘◀────└────┬─────┘     │  Rate    │
-   (Socket.io)        │           │  Limiting│
-                      ▼           └──────────┘
-                 ┌──────────┐
-                 │PostgreSQL│
-                 │   DB     │
-                 │ (Source  │
-                 │  of      │
-                 │  Truth)  │
-                 └──────────┘
-                      │
-                 ┌──────────┐
-                 │  BullMQ  │──▶ Emails / analytics / notifications
-                 │ Workers  │
-                 └──────────┘
+┌──────────┐     ┌──────────┐     ┌───────────────┐
+│  Next.js │────▶│ Fastify  │────▶│ Redis (opt.)  │
+│ Frontend │ WS  │   API    │     │ cache + short │
+└──────────┘◀────└────┬─────┘     │ -lived tokens │
+   (Socket.io)        │           └───────────────┘
+                      ▼
+                 ┌──────────────┐
+                 │ PostgreSQL   │──▶ source of truth
+                 │   DB         │──▶ email outbox (no Redis queue,
+                 └──────────────┘     no idle worker polling)
 ```
+
+Redis is an optional cache: if it is unavailable the API serves reads from
+PostgreSQL. There are no Redis-backed background workers — booking emails drain
+from a Postgres outbox on the 30s maintenance loop. See
+[docs/redis-audit.md](docs/redis-audit.md) for the command-consumption audit.
 
 ### Frontend
 - Next.js 15.5 (App Router) + React 19, TypeScript, Tailwind CSS
@@ -52,8 +49,10 @@ When thousands of users try to buy tickets for the same event simultaneously, na
 - DB-level UNIQUE constraints as the final double-booking safety net
 
 ### Caching / Distributed
-- Redis for caching (event/availability), rate limiting, idempotency keys, and auth tokens
-- BullMQ for background job processing (emails, analytics) with retry/backoff
+- Redis for caching (event/availability) and short-lived hashed auth tokens — optional, with Postgres fallbacks
+- Redis commands are issued only while serving requests: no workers, no polling, no idle background traffic
+- Rate limiting is in-process (`@fastify/rate-limit`) and costs zero Redis commands
+- Postgres email outbox for asynchronous delivery with retry/backoff (replaces BullMQ)
 
 ### Payments
 - **Stripe Payment Intents** integration (PCI-compliant, webhook-verified) — real provider
@@ -62,7 +61,7 @@ When thousands of users try to buy tickets for the same event simultaneously, na
 
 ### Email
 - Nodemailer SMTP transport for verification, password reset, booking confirmation, and cancellation emails
-- BullMQ workers deliver asynchronously; without SMTP config the transport logs to console (dev mode)
+- Booking emails are queued in the Postgres `email_outbox` and delivered by the maintenance loop (at-least-once, exponential backoff, capped attempts); without SMTP config the transport logs to console (dev mode)
 
 ## 🔐 Authentication
 
@@ -165,7 +164,7 @@ pnpm install
 
 # Set up environment
 cp .env.example .env   # if present; otherwise create .env per the table below
-# Edit .env — minimum: DATABASE_URL, REDIS_URL, JWT_SECRET
+# Edit .env — minimum: DATABASE_URL, JWT_SECRET (REDIS_URL is optional)
 
 # Start infrastructure (Postgres on host port 5433, Redis on 6379)
 docker compose up -d postgres redis
@@ -193,7 +192,10 @@ pnpm dev
 |---|---|---|
 | `DATABASE_URL` | ✅ | Postgres connection string |
 | `DIRECT_URL` | — | Direct (non-pooled) URL for migrations |
-| `REDIS_URL` | ✅ | Redis connection string (`redis://localhost:6379`) |
+| `REDIS_URL` | — | Redis connection string (`redis://localhost:6379`); any provider (`rediss://` for TLS) |
+| `REDIS_ENABLED` | — | `false` disables Redis entirely (quota-outage escape hatch) |
+| `REDIS_CONNECT_TIMEOUT_MS` / `REDIS_COMMAND_TIMEOUT_MS` | — | Fail-fast budgets (default 3000 / 1500) |
+| `REDIS_BREAKER_COOLDOWN_MS` | — | Circuit-breaker cooldown after repeated failures (default 30000) |
 | `JWT_SECRET` | ✅ | HMAC secret for JWT signing — **use a strong random value in production** |
 | `JWT_EXPIRES_IN` | — | Token lifetime (default `7d`) |
 | `API_PORT` / `API_HOST` | — | API bind config (default `3001`) |
@@ -202,10 +204,10 @@ pnpm dev
 | `PAYMENT_PROVIDER` | — | `mock` (default, dev) or `stripe` |
 | `PAYMENT_SECRET` | — | Stripe secret key (required when provider = `stripe`) |
 | `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASS` / `SMTP_FROM` | — | Real email delivery; if unset, emails log to console (dev) |
-| `RATE_LIMIT_GENERAL` / `RATE_LIMIT_BOOKING` / `RATE_LIMIT_LOGIN` / `RATE_LIMIT_WINDOW_MS` | — | Redis rate-limit tuning |
+| `RATE_LIMIT_GENERAL` / `RATE_LIMIT_BOOKING` / `RATE_LIMIT_LOGIN` / `RATE_LIMIT_WINDOW_MS` | — | In-process rate-limit tuning |
 | `BOOKING_HOLD_DURATION_MS` | — | Seat hold window |
 | `BOOKING_IDEMPOTENCY_EXPIRY_S` | — | Idempotency key TTL |
-| `QUEUE_CONCURRENCY` / `QUEUE_RETRY_ATTEMPTS` / `QUEUE_RETRY_DELAY_MS` | — | BullMQ worker tuning |
+| `EMAIL_OUTBOX_BATCH_SIZE` / `EMAIL_OUTBOX_MAX_ATTEMPTS` / `EMAIL_OUTBOX_RETRY_BASE_MS` | — | Postgres email-outbox drain tuning |
 
 ### Docker (full stack)
 
@@ -280,11 +282,10 @@ pnpm test:concurrency    # simultaneous booking race assertions
 - `booking_cancellations_total` — Booking cancellations
 
 ### Health Checks
-- `GET /health` — Liveness
-- `GET /health/ready` — Readiness (checks PostgreSQL + Redis)
+- `GET /health` — Liveness (no dependencies, zero Redis commands)
+- `GET /health/ready` — Readiness: PostgreSQL only (zero Redis commands — safe for keep-alive/uptime pings)
+- `GET /health/deps` — Manual diagnosis: PostgreSQL, one circuit-breaker-aware Redis PING, email-outbox depth
 
-### Grafana
-Access at `http://localhost:3002` (admin/admin — change in production)
 
 ## 🔑 Key Engineering Decisions
 
@@ -296,11 +297,11 @@ Access at `http://localhost:3002` (admin/admin — change in production)
 
 4. **Idempotency keys**: Prevents duplicate bookings from network retries.
 
-5. **Background jobs for non-critical work**: Confirmation emails, invoices, analytics don't block the booking response.
+5. **Background jobs for non-critical work**: Confirmation emails don't block the booking response, and they are durable — a Postgres outbox rather than a Redis worker, so asynchronous delivery costs no idle Redis commands.
 
 6. **Database constraints as final safety net**: UNIQUE constraints on (event_id, seat_number) prevent data corruption even if application code has a bug.
 
-7. **Real email verification over dev shortcuts**: Accounts are unusable until verified via emailed token; tokens are stored hashed with TTLs in Redis.
+7. **Real email verification over dev shortcuts**: Accounts are unusable until verified via emailed token; tokens are stored hashed with TTLs in Redis, with a Postgres fallback when Redis is unavailable.
 
 8. **Provider-swappable payments**: `PAYMENT_PROVIDER=mock|stripe` — same booking flow, no code changes, no accidental real charges in dev/test.
 
@@ -322,6 +323,7 @@ pulseseat/
 ## 📚 Documentation
 
 - [Architecture](docs/architecture.md)
+- [Redis Usage Audit](docs/redis-audit.md) — command consumption, circuit breaker, provider migration
 - [Concurrency Strategy](docs/concurrency.md)
 - [Database Design](docs/database.md)
 - [API Reference](docs/api.md)
@@ -337,7 +339,7 @@ pulseseat/
 - Email verification required before first login
 - Single-use, hashed, TTL-bound tokens for verification and password reset
 - Role-based access control (USER/ADMIN)
-- Redis rate limiting (general / booking / login buckets)
+- Rate limiting (general / booking / login buckets), in-process — no Redis dependency
 - Input validation (Zod) with a global error handler — validation failures return structured 400s, never stack traces
 - Stripe webhook signature verification
 - No secrets in source control
@@ -348,8 +350,8 @@ pulseseat/
 
 - **Stripe Payment Integration** — Real PCI-compliant payments via Stripe Payment Intents + signature-verified webhooks. Mock provider for dev.
 - **Real-Time Seat Updates** — Socket.io WebSocket broadcasting seat status changes to all connected clients instantly.
-- **Email Notifications** — SMTP-powered verification, password reset, booking confirmation, and cancellation emails via Nodemailer, processed asynchronously with BullMQ.
-- **Background Job Processing** — BullMQ workers for email delivery, analytics, and notifications with retry/backoff.
+- **Email Notifications** — SMTP-powered verification, password reset, booking confirmation, and cancellation emails via Nodemailer, delivered asynchronously from a Postgres outbox.
+- **Durable Background Jobs Without a Broker** — booking emails are claimed with `SKIP LOCKED` and retried with backoff, with no Redis worker polling the queue while idle.
 - **Real Authentication** — Email + password with mandatory email verification, forgot/reset password, rate-limited auth endpoints.
 - **Measured Performance** — k6 load-tested to 5,000 concurrent virtual users with a published, reproducible report and zero double-bookings verified in the database.
 

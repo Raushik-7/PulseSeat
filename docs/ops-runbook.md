@@ -41,10 +41,14 @@ the old readiness check PINGed Redis per probe, contributing to quota exhaustion
 
 ## The three outages to know
 
-1. **Upstash free tier → 0 commands left.** Redis 401s/dies. Post-fix impact:
-   first ~2 requests per endpoint uncached (direct Postgres), then the cache
-   layer enters a 30s degraded window and stops trying. **Action:** wait for
-   the monthly reset or upgrade; do NOT restart Render repeatedly (does nothing).
+1. **Upstash free tier → 0 commands left.** Redis rejects commands. Impact:
+   up to 3 failed commands, then the circuit breaker opens for 30s and issues
+   none at all; every read is served by Postgres. Recovery is a single probe
+   after each cooldown — no restart needed. **Action:** wait for the monthly
+   reset, upgrade, or set `REDIS_ENABLED=false` (and redeploy) to stop all Redis
+   traffic; do NOT restart Render repeatedly (does nothing).
+   *Quota never runs out while idle any more: the only Redis commands left are
+   request-driven cache reads/writes and auth tokens (no workers, no polling).*
 2. **Supabase paused.** Postgres unreachable entirely. `/health/ready` → 503.
    Everything dark including new bookings. **Action:** Supabase Dashboard →
    Resume the project (takes ~1 min). Consider a free cron ping to prevent.

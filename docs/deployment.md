@@ -1,6 +1,6 @@
 # Deploying PulseSeat
 
-> **Vercel quick-start:** the **frontend deploys to Vercel's free tier** (Next.js auto-detected, zero config). The **API cannot run on Vercel** — it's a long-running Fastify + Socket.io + BullMQ server (persistent WebSocket + background workers), which Vercel's serverless functions don't support. Deploy the API free on **Railway / Render / Fly.io**. Steps below; Vercel-specific details in [§ Vercel Deployment Steps](#vercel-deployment-steps-frontend).
+> **Vercel quick-start:** the **frontend deploys to Vercel's free tier** (Next.js auto-detected, zero config). The **API cannot run on Vercel** — it's a long-running Fastify + Socket.io server (persistent WebSocket + a 30s maintenance loop; no Redis-backed workers), which Vercel's serverless functions don't support. Deploy the API free on **Railway / Render / Fly.io**. Steps below; Vercel-specific details in [§ Vercel Deployment Steps](#vercel-deployment-steps-frontend).
 
 Two proven paths, from simplest to most production-grade. Pick based on budget and scale.
 
@@ -102,7 +102,8 @@ Required for: Stripe webhooks (HTTPS only), secure cookies, WebSocket (wss://).
 ### 7. Verify
 
 ```bash
-curl https://api.pulseseat.example.com/health/ready     # {"status":"ok"} → DB + Redis connected
+curl https://api.pulseseat.example.com/health/ready     # {"status":"ready"} → Postgres reachable
+curl https://api.pulseseat.example.com/health/deps      # optional: Postgres + Redis + email outbox
 curl -I https://pulseseat.example.com                   # 200
 ```
 
@@ -154,7 +155,7 @@ Then: sign up with a real email → receive verification email → verify → bo
 
 ## Pre-Launch Checklist
 
-- [ ] `GET /health/ready` returns ok (Postgres + Redis reachable)
+- [ ] `GET /health/ready` returns ready (Postgres reachable — Redis is optional)
 - [ ] `prisma migrate deploy` ran against the production DB (never `migrate reset` / `db:push`)
 - [ ] Signup → verification email arrives → login works end-to-end
 - [ ] Forgot-password email link uses the correct `NEXT_PUBLIC_APP_URL`
@@ -217,7 +218,7 @@ The web app is standard Next.js 15 App Router — Vercel requires **zero extra c
 
 ### 6. Verify
 ```bash
-curl https://<api-host>/health/ready          # postgres + redis healthy
+curl https://<api-host>/health/ready          # postgres ready (Redis optional)
 curl -I https://<project>.vercel.app          # 200
 ```
 Then in the browser: sign up → verification email → login → browse → seat select → book (mock provider) → My Bookings. Real-time: open the same event in two tabs; a booking in one updates the other.
@@ -226,8 +227,8 @@ Then in the browser: sign up → verification email → login → browse → sea
 
 | Component | Why | Free-tier home |
 |---|---|---|
-| **API server (Fastify + Socket.io + BullMQ)** | Persistent WebSocket server + long-running background workers; Vercel functions are stateless & time-limited | Railway / Render / Fly free/cheap tiers |
+| **API server (Fastify + Socket.io)** | Persistent WebSocket server + a long-running maintenance loop; Vercel functions are stateless & time-limited | Railway / Render / Fly free/cheap tiers |
 | **PostgreSQL** | Vercel doesn't host databases | Supabase / Neon free tiers |
 | **Redis** | Not hosted by Vercel | Upstash free tier |
-| **BullMQ workers** | Long-lived processes | Run inside the API deployment |
-| Vercel Cron | Not used by this app (job scheduling is BullMQ/Redis) | — |
+| **Email delivery** | Drained from the Postgres outbox by the API maintenance loop — no extra process or broker | Nothing to deploy |
+| Vercel Cron | Not used by this app (job scheduling is a Postgres outbox) | — |

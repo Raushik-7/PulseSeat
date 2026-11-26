@@ -121,6 +121,7 @@ Query params: `status` (CONFIRMED, CANCELLED, etc.)
 
 ### Health
 
-**GET /health** — Liveness
-**GET /health/ready** — Readiness (checks PostgreSQL + Redis)
-**GET /metrics** — Prometheus metrics
+**GET /health** — Liveness (no dependencies, zero Redis commands)
+**GET /health/ready** — Readiness: PostgreSQL only (zero Redis commands)
+**GET /health/deps** — Manual diagnosis: PostgreSQL + one Redis PING + email-outbox depth
+**GET /metrics** — Prometheus metrics (Postgres-backed, zero Redis commands)

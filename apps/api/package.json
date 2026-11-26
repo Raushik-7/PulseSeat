@@ -13,7 +13,8 @@
     "test": "vitest run",
     "test:unit": "vitest run --dir src/**/*.test.ts",
     "test:integration": "vitest run --dir tests/integration",
-    "test:concurrency": "vitest run --dir tests/concurrency"
+    "test:concurrency": "vitest run --dir tests/concurrency",
+    "check:redis": "tsx scripts/check-redis-resilience.ts"
   },
   "dependencies": {
     "@fastify/cors": "^10.0.0",
@@ -23,7 +24,6 @@
     "@fastify/swagger": "^9.0.0",
     "@fastify/swagger-ui": "^5.0.0",
     "@prisma/client": "^6.0.0",
-    "bullmq": "^5.0.0",
     "dotenv": "^17.4.2",
     "fastify": "^5.0.0",
     "ioredis": "^5.4.0",

@@ -214,6 +214,32 @@ model MetricCounter {
   @@map("metric_counters")
 }
 
+// Durable email outbox — replaces the BullMQ/Redis "emails" queue.
+//
+// Why: the BullMQ Worker that used to process booking emails polled Redis
+// continuously (BZPOPMIN on the queue marker every drainDelay seconds plus a
+// moveToActive EVALSHA per poll) even when the queue was empty — that idle
+// loop was the dominant consumer of the free Upstash command quota. Booking
+// email volume is tiny, so a Postgres queue drained by the existing
+// maintenance loop delivers the same durability with zero idle command cost
+// and no second broker to operate.
+model EmailOutbox {
+  id            String    @id @default(cuid())
+  type          String // 'booking-confirmation' | 'booking-cancellation'
+  payload       Json
+  status        String    @default("PENDING") // PENDING | SENDING | SENT | FAILED
+  attempts      Int       @default(0)
+  lastError     String?   @map("last_error")
+  nextAttemptAt DateTime  @default(now()) @map("next_attempt_at")
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+  sentAt        DateTime? @map("sent_at")
+
+  @@index([status, nextAttemptAt])
+  @@index([createdAt])
+  @@map("email_outbox")
+}
+
 model AuditLog {
   id         String   @id @default(cuid())
   userId     String?  @map("user_id")

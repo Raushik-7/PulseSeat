@@ -45,23 +45,6 @@ export async function getBookingMetrics(): Promise<Record<string, number>> {
   }
 }
 
-// Bridge for legacy counters (values written to Redis before this change).
-// Reads each key once per /metrics scrape (already bounded); deletes nothing.
-export async function hydrateLegacyRedisMetrics(keys: Record<string, string>): Promise<void> {
-  try {
-    const { getRedis } = await import('./redis');
-    const redis = getRedis();
-    for (const [metric, key] of Object.entries(keys)) {
-      const raw = await redis.get(key);
-      if (raw && Number(raw) > 0) {
-        await prisma.$executeRaw`
-          INSERT INTO metric_counters (metric, n)
-          VALUES (${metric}, ${Number(raw)})
-          ON CONFLICT (metric) DO UPDATE SET n = metric_counters.n + ${Number(raw)}, updated_at = now()
-        `;
-      }
-    }
-  } catch (err) {
-    logger.warn({ errMessage: err instanceof Error ? err.message : String(err) }, 'legacy metric hydration skipped');
-  }
-}
+// NOTE: the old `hydrateLegacyRedisMetrics` bridge (a GET loop over legacy
+// Redis counters) was removed. It was unused, and any Redis read on a metrics
+// path contradicts the goal: metrics are 100% Postgres now.

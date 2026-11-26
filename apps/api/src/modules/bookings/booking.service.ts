@@ -8,7 +8,7 @@ import { recordBookingMetric } from '../../plugins/booking-metrics';
 import { bumpEventsListVersion } from '../events/events.cache';
 import { config } from '../../config/index';
 import { getPaymentProvider, PaymentIntent } from '../payments/payments.service';
-import { enqueueBookingConfirmationEmail, enqueueBookingCancellationEmail } from '../email/email.worker';
+import { enqueueBookingConfirmationEmail, enqueueBookingCancellationEmail } from '../email/email.outbox';
 import { broadcastBulkSeatUpdate, broadcastAvailabilityUpdate } from '../../plugins/websocket';
 import { prisma } from '../../plugins/prisma';
 
